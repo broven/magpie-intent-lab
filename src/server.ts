@@ -5,6 +5,7 @@ import { JevClient } from "./jev";
 import { planApply, type ApplyPlan } from "./apply";
 import { dirname, extname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 
 export interface ServiceOptions {
   port?: number;
@@ -133,11 +134,69 @@ function sse(controller: ReadableStreamDefaultController<Uint8Array>, encoder: T
   controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
 }
 
+// The interface runs in magpie's frame, sandboxed to allow-scripts: its
+// origin is opaque, so every /api request is cross-origin with Origin "null".
+// "null" proves nothing (any site's sandboxed frame sends it), and this
+// service writes magpie's config and spends classifier calls, so /api also
+// takes a token of this process, written into the HTML this service serves
+// (served without CORS headers, so no other page can read it). The Host must
+// be this service's own, against DNS rebinding.
+export const TOKEN_HEADER = "x-intent-lab-token";
+const TOKEN = randomBytes(32).toString("hex");
+
+function ownHosts(port: number): Set<string> {
+  return new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
+}
+
+function originAllowed(origin: string | null, port: number): boolean {
+  if (origin === null || origin === "null") return true;
+  return [...ownHosts(port)].some(h => origin === `http://${h}`);
+}
+
+function tokenOK(request: Request): boolean {
+  const got = Buffer.from(request.headers.get(TOKEN_HEADER) ?? "");
+  const want = Buffer.from(TOKEN);
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+
+function withCors(response: Response, origin: string | null): Response {
+  response.headers.set("access-control-allow-origin", origin && origin !== "null" ? origin : "null");
+  response.headers.set("access-control-allow-headers", `content-type, ${TOKEN_HEADER}`);
+  response.headers.set("access-control-allow-methods", "GET, POST, OPTIONS");
+  response.headers.set("vary", "Origin");
+  return response;
+}
+
+function guarded(handle: (request: Request) => Promise<Response>) {
+  return async (request: Request, server: { port?: number }): Promise<Response> => {
+    const port = server.port ?? 0;
+    const host = (request.headers.get("host") ?? "").toLowerCase();
+    if (!ownHosts(port).has(host)) return failure(403, "host not allowed");
+    const origin = request.headers.get("origin");
+    if (!originAllowed(origin, port)) return failure(403, "origin not allowed");
+    const path = new URL(request.url).pathname;
+    if (!path.startsWith("/api/")) return handle(request);
+    if (request.method === "OPTIONS") return withCors(new Response(null, { status: 204 }), origin);
+    if (!tokenOK(request)) return withCors(failure(403, "missing or wrong token"), origin);
+    return withCors(await handle(request), origin);
+  };
+}
+
+async function indexResponse(): Promise<Response | null> {
+  const file = Bun.file(join(uiDir, "index.html"));
+  if (!(await file.exists())) return null;
+  const html = (await file.text()).replace("</head>", `<meta name="intent-lab-token" content="${TOKEN}">\n</head>`);
+  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+}
+
 function makeFetch(jev: JevClient, magpieBin: string) {
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
     try {
-      if (request.method === "GET" && (url.pathname === "/" || url.pathname.startsWith("/ui/"))) {
+      if (request.method === "GET" && url.pathname === "/") {
+        return (await indexResponse()) ?? failure(404, "not found");
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/ui/")) {
         return (await staticResponse(url.pathname)) ?? failure(404, "not found");
       }
       if (request.method === "GET" && url.pathname === "/api/groups") {
@@ -242,7 +301,7 @@ export async function startService(options: ServiceOptions = {}): Promise<Runnin
   const bin = resolveMagpieBin(options);
   for (;;) {
     try {
-      const server = Bun.serve({ hostname: "127.0.0.1", port: requested, idleTimeout: 255, fetch: makeFetch(jev, bin) });
+      const server = Bun.serve({ hostname: "127.0.0.1", port: requested, idleTimeout: 255, fetch: guarded(makeFetch(jev, bin)) });
       const port = server.port ?? requested;
       if (options.log !== false) console.log(`intent-lab listening http://127.0.0.1:${port}`);
       return { server, port, jev };

@@ -26,6 +26,7 @@ bun install
 bash scripts/parity.sh   # 与 magpie Go 源码对拍（需 MAGPIE_SOURCE 指向 magpie 源码，默认 /tmp/magpie-latest）
 bun scripts/e2e.ts       # 端到端：真实样本 + 真实 Jev + 沙箱写回
 bun scripts/ui-shot.ts   # 截图（需要 playwright）
+bun scripts/frame-check.ts  # 按 magpie 窗口的方式（sandbox iframe + 页面 CSP）加载，确认能连上 service
 magpie plugin add "$PWD" # 本地安装；改完代码再 add 一次即可重载
 ```
 

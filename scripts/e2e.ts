@@ -31,6 +31,8 @@ const child = Bun.spawn([process.execPath, join(root, "src/server.ts")], {
   stderr: "inherit",
 });
 let base = "";
+let token = "";
+const auth = () => ({ "x-intent-lab-token": token });
 const stdout = (async () => {
   const reader = child.stdout.getReader();
   let buffer = "";
@@ -51,14 +53,14 @@ function check(label: string, detail: unknown) {
   console.log(`PASS ${label}`);
 }
 async function json(path: string, body?: unknown) {
-  const response = await fetch(base + path, body === undefined ? {} : {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  const response = await fetch(base + path, body === undefined ? { headers: auth() } : {
+    method: "POST", headers: { "content-type": "application/json", ...auth() }, body: JSON.stringify(body),
   });
   if (!response.ok) throw Error(`${path}: HTTP ${response.status} ${await response.text()}`);
   return response.json() as Promise<any>;
 }
 async function run(body: unknown) {
-  const response = await fetch(base + "/api/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const response = await fetch(base + "/api/run", { method: "POST", headers: { "content-type": "application/json", ...auth() }, body: JSON.stringify(body) });
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
   const events: any[] = [];
@@ -92,7 +94,10 @@ try {
   artifact.base = base;
   const page = await fetch(base + "/");
   assert.equal(page.status, 200);
-  assert.match(await page.text(), /Intent Lab/);
+  const pageHtml = await page.text();
+  assert.match(pageHtml, /Intent Lab/);
+  token = pageHtml.match(/name="intent-lab-token" content="([0-9a-f]{64})"/)?.[1] ?? "";
+  assert.ok(token, "served HTML must carry the API token");
   const { groups } = await json("/api/groups");
   const group = groups.find((g: any) => g.id === "claude-opus");
   assert.ok(group, "claude-opus must be present");
@@ -154,6 +159,23 @@ try {
   const anchors = ["draft-editor", "run-button", "result-table", "group-select", "limit-input", "summary", "apply-preview", "apply-run"];
   for (const anchor of anchors) assert.ok(html.includes(`data-testid="${anchor}"`), `UI must contain data-testid=${anchor}`);
   check("7 UI anchors", { anchors });
+  // 8: the frame's page and the service's guard. magpie's page policy runs
+  // scripts from the plugin's folder only, so the page may hold no inline one.
+  const framePage = await Bun.file(new URL("../page/index.html", import.meta.url)).text();
+  assert.equal(/<script(?![^>]*\bsrc=)[^>]*>/i.test(framePage), false, "page/index.html must have no inline <script>");
+  assert.ok(await Bun.file(new URL("../page/boot.js", import.meta.url)).exists(), "page/boot.js must exist");
+  const status = async (headers: Record<string, string>, path = "/api/groups", method = "GET") =>
+    (await fetch(base + path, { method, headers })).status;
+  assert.equal(await status({}), 403, "no token must be refused");
+  assert.equal(await status({ ...auth(), origin: "https://evil.example" }), 403, "a foreign origin must be refused");
+  assert.equal(await status({ ...auth(), host: "evil.example" }), 403, "a foreign host must be refused");
+  const framed = await fetch(base + "/api/groups", { headers: { ...auth(), origin: "null" } });
+  assert.equal(framed.status, 200, "the sandboxed frame (Origin null) with the token must be served");
+  assert.equal(framed.headers.get("access-control-allow-origin"), "null");
+  assert.equal(await status({ origin: "null", "access-control-request-method": "POST", "access-control-request-headers": "content-type, x-intent-lab-token" }, "/api/run", "OPTIONS"), 204, "preflight must pass");
+  const index = await fetch(base + "/", { headers: { origin: "null" } });
+  assert.equal(index.headers.get("access-control-allow-origin"), null, "the HTML holding the token must carry no CORS header");
+  check("8 frame page has no inline script; service guard", { refused: ["no token", "foreign origin", "foreign host"], allowed: "Origin null + token" });
   artifact.status = "PASS";
 } catch (error: any) {
   artifact.status = "FAIL";

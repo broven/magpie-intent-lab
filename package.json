@@ -1,15 +1,18 @@
 {
   "name": "magpie-intent-lab",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "main": "index.js",
-  "keywords": ["magpie-plugin"],
+  "keywords": [
+    "magpie-plugin"
+  ],
   "scripts": {
     "start": "bun src/server.ts",
     "parity": "bash scripts/parity.sh",
     "e2e": "bun scripts/e2e.ts",
-    "ui-shot": "bun scripts/ui-shot.ts"
+    "ui-shot": "bun scripts/ui-shot.ts",
+    "frame-check": "bun scripts/frame-check.ts"
   },
   "dependencies": {
     "re2js": "2.10.0"
@@ -17,11 +20,18 @@
   "magpie": {
     "page": {
       "title": "Intent Lab",
-      "titles": {"zh": "意图回测"},
+      "titles": {
+        "zh": "意图回测"
+      },
       "file": "page/index.html",
       "icon": "page/icon.svg",
-      "service": {"port": 3488, "option": "port"}
+      "service": {
+        "port": 3488,
+        "option": "port"
+      }
     },
-    "options": {"port": 3488}
+    "options": {
+      "port": 3488
+    }
   }
 }

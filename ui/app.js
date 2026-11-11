@@ -1,3 +1,9 @@
+// The service takes a token of its own on /api (see src/server.ts), and
+// is asked by relative address so it works behind magpie web's proxy path.
+const API_TOKEN = document.querySelector('meta[name="intent-lab-token"]')?.content ?? "";
+function api(path, init = {}) {
+  return fetch(path.replace(/^\//, ""), { ...init, headers: { ...(init.headers || {}), "x-intent-lab-token": API_TOKEN } });
+}
 const $ = (selector, root = document) => root.querySelector(selector);
 
 const state = {
@@ -185,7 +191,7 @@ function selectGroup(id) {
 }
 
 async function loadGroups() {
-  const response = await fetch("/api/groups");
+  const response = await api("/api/groups");
   if (!response.ok) throw new Error(await response.text());
   const data = await response.json();
   state.groups = data.groups ?? [];
@@ -220,7 +226,7 @@ function setProgress(done, total, phase) {
 }
 
 async function runBacktest(body) {
-  const response = await fetch("/api/run", {
+  const response = await api("/api/run", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
@@ -463,7 +469,7 @@ function invalidateApply(message = "草稿已修改，请重新预览。") {
 }
 
 async function postApply(body) {
-  const response = await fetch("/api/apply", {
+  const response = await api("/api/apply", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
@@ -511,7 +517,7 @@ function renderApplyPlan(data) {
 
 async function refreshGroup() {
   if (!state.group) return;
-  const response = await fetch("/api/groups");
+  const response = await api("/api/groups");
   if (!response.ok) return;
   const data = await response.json();
   state.groups = data.groups ?? state.groups;
