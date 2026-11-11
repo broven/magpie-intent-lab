@@ -78,6 +78,63 @@ magpie（yetone/magpie）社区插件。用**历史会话**回测路由组的 `i
   - 点一行展开：全文、上一轮上下文、两边 Jev 的原始答案。
 - 写回：先预览命令，确认后执行，执行完显示读回的规则。
 
+## 阶段 C：判定逻辑可视化 + 会话过滤（2026-11-11 与用户确认）
+
+### C1 判定逻辑面板（全局，可折叠，放在样本条件上方）
+
+用当前组的**实际参数**，按顺序写出 magpie 的判定链路。每一步都标出对应的 Go 源码位置，方便核对：
+
+1. **何时判**：每个 turn 开始时（第一条有用户话语的新消息）判一次；同一 turn 里的后续请求沿用这个结果（`rules.go` turnRules）。
+2. **取哪段文本**：最后一条 `userSaid` 非空的 user 消息。
+   - 去掉 `<system-reminder>`，只取 `## My request:` 之后的部分。
+   - 以注入前缀开头的整段不算用户话（列出当前的前缀表）。
+   - 截断为前 3000 字 + `\n…\n` + 后 1000 字。
+3. **上一轮上下文**：上一条用户话截成 750+250 字；上一条纯文本助手回复取末尾 1000 字。若上一轮 intent 也在本组 intents 里，就作为 `previous_message_kind` 一起发给 Jev。
+4. **问 Jev**：分类器名称；选项是本组 intents（列出来）加上 `none of these`。intents 多于 1 个时，先做 levels 探测，显示这次探测的结果（levels 还是 topics）。
+5. **读答案**：`sure` 的计算方式。topics 要求 `sure ≥ intentSure`（显示当前值，默认 0.4），并且答案不是 `none of these`；levels 不受阈值约束，`sure < 0.4` 时回退到上一轮 intent。
+6. **选规则**：从上往下第一条所有条件都满足的规则胜出，使用它的 `use`。规则的非 intent 条件，样本有对应特征才判，否则记为 unknown 并按不匹配处理。没有命中任何规则时，按组的默认路由走。
+7. **与真实路由的差异**（固定文案）：
+   - 输入来自 transcript，而不是请求体；
+   - 移植参照的上游源码版本（构建时写入 commit），可能和本机 magpie 版本不同；
+   - 非 intent 条件会出现 unknown；
+   - Jev 模型版本会变（显示答案里的 `model`，例如 jev-1.14.0）。
+
+### C2 单行「判定过程」（展开一行结果时显示，current 和 draft 各一列）
+
+- **最终发给 Jev 的 `message`**：截断处要标出来。另外列出被剥掉的片段，摘要即可：system-reminder 段数、`## My request:` 之前的字数、是否整段判为注入内容。
+- **上一轮上下文**：`previous_user_message`、`previous_assistant_reply`、`previous_message_kind`。
+- **Jev 返回结果**：返回的 model、choice、confidence、probabilities（画成条形）、算出的 `sure`、阈值、是否达标、最终 intent。如果做了 levels 探测，同时显示探测结果。是否命中缓存也要标出。
+- **规则逐条判定**：每条规则对每个条件逐一给出 ✓ / ✗ / unknown 和原因，最后得出选中的规则和 use。
+- 可以折叠查看原始请求体和原始答案 JSON。
+
+为此 `/api/run` 每行要额外返回 `trace`：`{stripped, cut, prev, jevRequest, jevAnswer, levelProbe, sure, threshold, passed, intent, cached, ruleWalk:[{n, use, conds:[{name, want, got, result:"pass"|"fail"|"unknown", why}]}], chosen}`。current 和 draft 各一份。
+
+### C3 会话过滤（只限 magpie 路由过的会话）
+
+- 搜索条件**只用来找目标会话**。会话命中后，它在日期和 agent 范围内的**全部 user turn** 按 magpie 内置逻辑进入回测，每个 turn 都判。不做「只取命中 turn」。
+- **搜索框**：纯文本，不区分大小写；提供一个可选的「正则」开关。
+- **搜索范围多选**（默认只勾「首条消息」）：
+  - **首条消息**：会话第一条 `userSaid` 非空的消息；
+  - **全部 user 消息**：每条 `userSaid` 非空的消息；
+  - **agent 回复**：助手的纯文本部分，不含 thinking；
+  - **bash 命令 + 结果**：
+    - claude：`tool_use` 里 `name=Bash` 的 `input.command`，以及对应的 `tool_result` 文本；
+    - codex：shell / exec 类 function_call 的命令和输出；
+    - pi：bash 工具的调用和结果。
+    - 结果文本按每条 4000 字截断后再参与搜索。
+- **会话列表**：先搜索，结果按会话列出：agent、folder、起止时间、首条消息摘要、命中次数、前 3 处命中片段（高亮）、turn 数。
+  - 每个会话有复选框，默认全选命中的会话，可以手动取消。
+  - 「回测」只用勾选的会话。不搜索时行为和现在一样（最近 N 个 turn）。
+- **会话预览浮层**：会话列表和结果表的每一行都能打开。
+  - 按时间顺序显示 user 消息、助手回复、bash 命令和结果（默认折叠，可展开）。
+  - 高亮搜索命中，标出每个回测样本 turn；在结果表里打开时，定位到对应的 turn。
+  - Esc 或点遮罩关闭。420px 宽时全屏显示。只读。
+- **API**：
+  - `GET /api/sessions?q=&regex=&scopes=first,user,reply,bash&agents=&from=&to=&limit=100`：返回会话列表和命中片段；
+  - `GET /api/session?id=`：返回预览内容；
+  - `POST /api/run` 增加 `sessions:[id]` 参数，传了就只回测这些会话。
+- **性能**：transcript 解析结果在内存里缓存，按文件 mtime 失效。全量搜索一次应在 5 秒内完成（claude 约 528 个会话）。
+
 ## 验收
 
 - **对拍（parity）**：`scripts/parity.sh` 在 `/tmp/magpie-latest` 的临时副本里加一个 Go 测试，对 `fixtures/*.json`（原始 messages）输出 `userSaid`、`lastSaid`、`cutMiddle`、`turnBefore`、`jevBody`。TS 对同一批输入输出同样的内容，逐字节比较，打印 `parity: N/N identical`。
