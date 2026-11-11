@@ -66,6 +66,7 @@ export function renderRule(rule: Rule, group: Group): { words?: string[]; reason
     }
     words.push("intent=" + rule.intent);
   }
+  if ("compact" in rule && rule.compact !== true) return { reason: "compact 只能是无损写回的 true" };
   if (rule.compact) words.push("compact");
   if (rule.time) {
     const t = rule.time;
@@ -95,12 +96,21 @@ export function renderRule(rule: Rule, group: Group): { words?: string[]; reason
 }
 
 // planApply writes only intent and use of existing rules, plus added and
-// removed rules. Everything else in the group is left alone.
-export function planApply(group: Group, draft: Group, bin: string): ApplyPlan {
+// removed rules. Everything else in the group is left alone. A baseline is
+// the rules the draft was made from: if the group changed since then, the
+// draft no longer describes the current rules and writing it back would
+// delete rules the user never saw.
+export function planApply(group: Group, draft: Group, bin: string, baseline?: Rule[]): ApplyPlan {
   const currentRules = group.rules ?? [];
   const draftRules = draft.rules ?? [];
   const rejected: RejectedRule[] = [];
   const commands: string[] = [];
+  if (baseline !== undefined) {
+    if (!Array.isArray(baseline)) return { commands: [], rejected: [], error: "baseline 必须是规则数组" };
+    if (stable(currentRules) !== stable(baseline)) {
+      return { commands: [], rejected: [], error: "路由组规则已在加载后变化，请刷新后再写回" };
+    }
+  }
   const currentSure = group.intentSure ?? null;
   const draftSure = draft.intentSure ?? null;
   if (currentSure !== draftSure) {

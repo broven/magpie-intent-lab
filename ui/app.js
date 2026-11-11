@@ -394,7 +394,8 @@ function renderSummary() {
   if (!state.result) return;
   const { summary, stats, cache } = state.result;
   const sessions = state.result.sessions ?? [];
-  const timing = summary.timing;
+  const main = sessions.filter(session => !session.parentId);
+  const children = sessions.filter(session => !!session.parentId);
   const turns = sessions.reduce((sum, session) => sum + session.turns, 0);
 
   const grid = el("div", "summary-grid");
@@ -405,49 +406,79 @@ function renderSummary() {
     box.append(el("span", "", label));
     grid.append(box);
   };
-  stat("会话", sessions.length);
+  stat("主会话", main.length);
+  stat("子 agent", children.length);
   stat("轮次", turns);
   stat("变化轮次", summary.changed);
-  if (timing) {
-    stat("单轮会话", timing.single, "timing-single");
-    stat("开头命中", timing.early, "timing-early");
-    stat("中途命中", timing.mid, "timing-mid");
-    stat("未命中", timing.miss, "timing-miss");
-  }
   if (cache) stat("Jev 新请求 / 缓存命中", `${cache.requests ?? 0} / ${cache.hits ?? 0}`);
   summaryNode.append(grid);
 
-  if (timing) {
-    const ratio = el("p", "timing-ratios");
-    ratio.dataset.testid = "timing-ratios";
-    ratio.textContent = `多轮 ${timing.multi} 个：开头 ${(100 * timing.ratios.early).toFixed(1)}% · 中途 ${(100 * timing.ratios.mid).toFixed(1)}% · 未命中 ${(100 * timing.ratios.miss).toFixed(1)}%（K=${timing.k}${timing.stopAfterHit ? "，草稿命中即停" : ""}）`;
-    summaryNode.append(ratio);
-
-    const title = el("h3", "", "第一次命中所在轮次");
+  const timing = summary.timing;
+  if (timing?.main && timing?.subagents) {
+    const title = el("h3", "", "命中时机（主会话 / 子 agent）");
     title.style.fontSize = "13px";
     title.style.margin = "14px 0 6px";
     summaryNode.append(title);
-    const wrap = el("div", "matrix-wrap timing-histogram");
-    wrap.dataset.testid = "timing-histogram";
+    const wrap = el("div", "matrix-wrap timing-split");
     const table = el("table");
     const thead = el("thead");
     const head = el("tr");
-    head.append(el("th", "", "轮次"));
-    for (const bin of ["1", "2", "3", "4–5", "6–10", ">10"]) head.append(el("th", "", bin));
+    for (const value of ["指标", "主会话", "子 agent"]) head.append(el("th", "", value));
     thead.append(head);
     table.append(thead);
     const tbody = el("tbody");
-    const row = el("tr");
-    row.append(el("th", "", "会话数"));
-    for (const bin of ["1", "2", "3", "4-5", "6-10", ">10"]) row.append(el("td", "", String(timing.histogram[bin] ?? 0)));
-    tbody.append(row);
+    const line = (label, mainValue, subValue, testid) => {
+      const row = el("tr");
+      const th = el("th", "", label);
+      if (testid) th.dataset.testid = testid;
+      row.append(th);
+      row.append(el("td", "", String(mainValue)));
+      row.append(el("td", "", String(subValue)));
+      tbody.append(row);
+    };
+    line("单轮会话", timing.main.single, timing.subagents.single, "timing-single");
+    line("开头命中", timing.main.early, timing.subagents.early, "timing-early");
+    line("中途命中", timing.main.mid, timing.subagents.mid, "timing-mid");
+    line("未命中", timing.main.miss, timing.subagents.miss, "timing-miss");
+    line("多轮", timing.main.multi, timing.subagents.multi);
     table.append(tbody);
     wrap.append(table);
     summaryNode.append(wrap);
 
+    const ratioText = (value) => `多轮 ${value.multi} 个：开头 ${(100 * value.ratios.early).toFixed(1)}% · 中途 ${(100 * value.ratios.mid).toFixed(1)}% · 未命中 ${(100 * value.ratios.miss).toFixed(1)}%`;
+    const ratio = el("p", "timing-ratios");
+    ratio.dataset.testid = "timing-ratios";
+    ratio.textContent = `主会话：${ratioText(timing.main)}；子 agent：${ratioText(timing.subagents)}（K=${timing.k}${timing.stopAfterHit ? "，草稿命中即停" : ""}）`;
+    summaryNode.append(ratio);
+
+    const histTitle = el("h3", "", "第一次命中所在轮次");
+    histTitle.style.fontSize = "13px";
+    histTitle.style.margin = "14px 0 6px";
+    summaryNode.append(histTitle);
+    const histWrap = el("div", "matrix-wrap timing-histogram");
+    histWrap.dataset.testid = "timing-histogram";
+    const histTable = el("table");
+    const histHead = el("thead");
+    const histHeadRow = el("tr");
+    histHeadRow.append(el("th", "", ""));
+    for (const bin of ["1", "2", "3", "4–5", "6–10", ">10"]) histHeadRow.append(el("th", "", bin));
+    histHead.append(histHeadRow);
+    histTable.append(histHead);
+    const histBody = el("tbody");
+    for (const [label, value] of [["主会话", timing.main], ["子 agent", timing.subagents]]) {
+      const row = el("tr");
+      row.append(el("th", "", label));
+      for (const bin of ["1", "2", "3", "4-5", "6-10", ">10"]) row.append(el("td", "", String(value.histogram[bin] ?? 0)));
+      histBody.append(row);
+    }
+    histTable.append(histBody);
+    histWrap.append(histTable);
+    summaryNode.append(histWrap);
+
+    const costText = (value) => `${value.midCost.switches} 次切换 · 重写前缀 ${value.midCost.estimatedTokens ? "≈" : ""}${formatTokens(value.midCost.prefixTokens)} tokens · 中位数 ${value.midCost.median} tokens`;
     const midCost = el("p", "timing-mid-cost");
     midCost.dataset.testid = "timing-mid-cost";
-    midCost.textContent = `中途命中切换代价：${timing.midCost.switches} 次切换 · 重写前缀 ${timing.midCost.estimatedTokens ? "≈" : ""}${formatTokens(timing.midCost.prefixTokens)} tokens · 中位数 ${timing.midCost.median} tokens`;
+    midCost.textContent = `中途命中切换代价：主会话 ${costText(timing.main)}；子 agent ${costText(timing.subagents)}`;
     summaryNode.append(midCost);
   }
 
@@ -744,13 +775,26 @@ function renderSessionList(data) {
     });
     head.append(preview);
     card.append(head);
-    card.append(el("div", "session-time", `最后一轮 ${formatTime(session.lastTurn)} · ${session.turns} 轮`));
     card.append(el("div", "session-first", shortText(session.first, 240) || "（首条消息为空）"));
+    const meta = el("div", "session-time");
+    meta.append(el("span", "", `最后一轮 ${formatTime(session.lastTurn)} · ${session.turns} 轮`));
+    if (session.subagents) {
+      const subagents = el("span", "session-subagents", `含 ${session.subagents} 个子 agent`);
+      subagents.dataset.testid = "session-subagents";
+      meta.append(subagents);
+    }
+    card.append(meta);
     if (searching) card.append(el("div", "session-meta", `命中 ${session.hits} 次`));
     const snippets = el("div", "snippets");
     if (searching) {
       for (const snippet of (session.snippets || []).slice(0, 3)) {
         const row = el("div", "snippet");
+        if (snippet.subagent) {
+          const badge = el("span", "subagent-badge", "子 agent");
+          badge.dataset.testid = "snippet-subagent";
+          badge.title = snippet.subagent;
+          row.append(badge);
+        }
         row.append(el("span", "scope", snippet.scope));
         const text = el("span", "snippet-text");
         text.innerHTML = (snippet.lead ? "…" : "") + highlightHtml(snippet.text, state.sessionQuery.q, state.sessionQuery.regex) + (snippet.trail ? "…" : "");
@@ -852,11 +896,8 @@ function closeSessionModal() {
   $("#session-modal-body").replaceChildren();
 }
 
-function renderPreview(data) {
-  const body = $("#session-modal-body");
-  body.replaceChildren();
-  body.append(el("div", "preview-meta", `${data.agent} · ${data.folder || "—"} · ${data.turnCount} 个回测 turn`));
-  data.items.forEach((item, index) => {
+function renderPreviewItems(container, items, focus) {
+  items.forEach((item, index) => {
     if (item.kind === "bash") {
       const details = document.createElement("details");
       details.className = "preview-item bash";
@@ -871,7 +912,7 @@ function renderPreview(data) {
       const output = el("pre", "", "");
       output.innerHTML = highlightHtml(item.output || "（无输出）", state.sessionQuery.q, state.sessionQuery.regex);
       details.append(output);
-      body.append(details);
+      container.append(details);
       return;
     }
     const node = el("div", "preview-item " + item.kind);
@@ -885,14 +926,50 @@ function renderPreview(data) {
     const text = el("div", "preview-text");
     text.innerHTML = highlightHtml(item.text || "", state.sessionQuery.q, state.sessionQuery.regex);
     node.append(text);
-    body.append(node);
+    container.append(node);
   });
-  if (data.focus >= 0) {
-    const target = body.querySelector(`[data-index="${data.focus}"]`);
+  if (focus >= 0) {
+    const target = container.querySelector(`[data-index="${focus}"]`);
     if (target) {
       target.classList.add("focus");
       target.scrollIntoView({ block: "center" });
     }
+  }
+}
+
+function renderPreview(data) {
+  const body = $("#session-modal-body");
+  body.replaceChildren();
+  const meta = el("div", "preview-meta", `${data.agent} · ${data.folder || "—"} · ${data.turnCount} 个回测 turn`);
+  if (data.subagents?.length) meta.append(el("span", "session-subagents", `含 ${data.subagents.length} 个子 agent`));
+  body.append(meta);
+  renderPreviewItems(body, data.items, data.focus);
+  for (const sub of data.subagents ?? []) {
+    const details = el("details", "preview-subagent");
+    details.dataset.testid = "preview-subagent";
+    details.dataset.subagentId = sub.subagentId;
+    const summary = el("summary", "preview-subagent-head");
+    summary.append(el("span", "subagent-badge", "子 agent"));
+    summary.append(el("b", "", sub.subagentId));
+    summary.append(el("span", "muted", `${sub.turnCount} 轮 · ${shortText(sub.first, 120) || "（首条消息为空）"}`));
+    details.append(summary);
+    const pane = el("div", "preview-subagent-body");
+    details.append(pane);
+    details.addEventListener("toggle", async () => {
+      if (!details.open || details.dataset.loaded) return;
+      details.dataset.loaded = "1";
+      pane.append(el("p", "empty-state", "正在读取子 agent…"));
+      try {
+        const response = await api("/api/session?id=" + encodeURIComponent(sub.id));
+        const child = await response.json();
+        if (!response.ok) throw new Error(child.error || `HTTP ${response.status}`);
+        pane.replaceChildren();
+        renderPreviewItems(pane, child.items, -1);
+      } catch (error) {
+        pane.replaceChildren(el("p", "warn", "读取子 agent 失败：" + (error?.message || String(error))));
+      }
+    });
+    body.append(details);
   }
 }
 
@@ -984,6 +1061,77 @@ function timelineFor(session) {
   return timeline;
 }
 
+function sessionCard(session, subagent = false) {
+  const card = el("article", "session-result" + (subagent ? " subagent-result" : ""));
+  card.dataset.testid = subagent ? "subagent-result" : "session-result";
+  card.dataset.class = session.class;
+  const head = el("div", "session-result-head");
+  head.dataset.testid = "session-result-head";
+  const badge = el("span", timingBadgeClass(session.class), timingLabel(session.class));
+  head.append(badge);
+  const title = subagent
+    ? `子 agent ${session.subagentId || session.agent} · ${session.folder || "—"}`
+    : `${session.agent} · ${session.folder || "—"}`;
+  head.append(el("b", "session-result-agent", title));
+  head.append(el("span", "muted", `${session.turns} 轮`));
+  head.append(el("span", "muted", session.firstHit === null ? "未命中" : `第一次命中：第 ${session.firstHit} 轮`));
+  if (session.switched) {
+    const mark = el("span", "switch-mark");
+    mark.dataset.testid = "session-switch";
+    mark.append(el("span", "from", shortMember(session.from)));
+    mark.append(el("span", "arrow", "→"));
+    mark.append(el("span", "to", shortMember(session.to)));
+    mark.title = `${memberName(session.from)} → ${memberName(session.to)}`;
+    head.append(mark);
+    if (session.prefixTokens) head.append(el("span", "switch-cost", `${formatTokens(session.prefixTokens)} 前缀 tokens`));
+  }
+  const preview = el("button", "secondary tiny", "预览");
+  preview.type = "button";
+  preview.dataset.testid = subagent ? "subagent-preview-button" : "session-preview-result";
+  preview.addEventListener("click", event => {
+    event.stopPropagation();
+    const hit = session.firstHit === null ? null : session.rows.find(row => row.turn === session.firstHit);
+    openSession(session.id, hit?.id);
+  });
+  head.append(preview);
+  card.append(head);
+  card.append(el("div", "session-first", shortText(session.first, 240) || "（首条消息为空）"));
+  card.append(timelineFor(session));
+
+  if (!subagent) {
+    const children = (state.result?.sessions ?? []).filter(child => child.parentId === session.id);
+    if (children.length) {
+      const summary = el("div", "subagent-count", `含 ${children.length} 个子 agent`);
+      summary.dataset.testid = "result-subagents";
+      card.append(summary);
+      const details = document.createElement("details");
+      details.className = "subagent-group";
+      details.dataset.testid = "subagent-summary";
+      const label = el("summary", "subagent-summary-head");
+      const counts = { early: 0, mid: 0, miss: 0 };
+      for (const child of children) counts[child.class] = (counts[child.class] ?? 0) + 1;
+      label.textContent = `${children.length} 个子 agent：开头 ${counts.early} / 中途 ${counts.mid} / 未命中 ${counts.miss}`;
+      details.append(label);
+      const body = el("div", "subagent-results");
+      for (const child of children) body.append(sessionCard(child, true));
+      details.append(body);
+      card.append(details);
+    }
+  }
+
+  const turns = el("div", "session-turns");
+  turns.hidden = true;
+  turns.dataset.testid = "session-turns";
+  turns.append(turnTable(session.rows));
+  card.append(turns);
+  head.addEventListener("click", event => {
+    if (event.target.closest("button")) return;
+    turns.hidden = !turns.hidden;
+    card.classList.toggle("open", !turns.hidden);
+  });
+  return card;
+}
+
 function renderResults() {
   const body = $("#session-results");
   body.replaceChildren();
@@ -994,60 +1142,17 @@ function renderResults() {
     $("#result-count").textContent = "";
     return;
   }
-  const sessions = (state.result.sessions ?? []).filter(session => !state.filterTiming || session.class === state.filterTiming);
-  $("#result-count").textContent = `${sessions.length} 个会话`;
+  const all = state.result.sessions ?? [];
+  const sessions = all.filter(session => !session.parentId && (!state.filterTiming || session.class === state.filterTiming));
+  const children = all.filter(session => !!session.parentId).length;
+  $("#result-count").textContent = `${sessions.length} 个主会话 · ${children} 个子 agent`;
   if (!sessions.length) {
     setHidden(empty, false);
     empty.textContent = "没有符合分类条件的会话。";
     return;
   }
   setHidden(empty, true);
-  for (const session of sessions) {
-    const card = el("article", "session-result");
-    card.dataset.testid = "session-result";
-    card.dataset.class = session.class;
-    const head = el("div", "session-result-head");
-    head.dataset.testid = "session-result-head";
-    const badge = el("span", timingBadgeClass(session.class), timingLabel(session.class));
-    head.append(badge);
-    head.append(el("b", "session-result-agent", `${session.agent} · ${session.folder || "—"}`));
-    head.append(el("span", "muted", `${session.turns} 轮`));
-    head.append(el("span", "muted", session.firstHit === null ? "未命中" : `第一次命中：第 ${session.firstHit} 轮`));
-    if (session.switched) {
-      const mark = el("span", "switch-mark");
-      mark.dataset.testid = "session-switch";
-      mark.append(el("span", "from", shortMember(session.from)));
-      mark.append(el("span", "arrow", "→"));
-      mark.append(el("span", "to", shortMember(session.to)));
-      mark.title = `${memberName(session.from)} → ${memberName(session.to)}`;
-      head.append(mark);
-      if (session.prefixTokens) head.append(el("span", "switch-cost", `${formatTokens(session.prefixTokens)} 前缀 tokens`));
-    }
-    const preview = el("button", "secondary tiny", "预览");
-    preview.type = "button";
-    preview.dataset.testid = "session-preview-result";
-    preview.addEventListener("click", event => {
-      event.stopPropagation();
-      const hit = session.firstHit === null ? null : session.rows.find(row => row.turn === session.firstHit);
-      openSession(session.id, hit?.id);
-    });
-    head.append(preview);
-    card.append(head);
-    card.append(el("div", "session-first", shortText(session.first, 240) || "（首条消息为空）"));
-    card.append(timelineFor(session));
-
-    const turns = el("div", "session-turns");
-    turns.hidden = true;
-    turns.dataset.testid = "session-turns";
-    turns.append(turnTable(session.rows));
-    card.append(turns);
-    head.addEventListener("click", event => {
-      if (event.target.closest("button")) return;
-      turns.hidden = !turns.hidden;
-      card.classList.toggle("open", !turns.hidden);
-    });
-    body.append(card);
-  }
+  for (const session of sessions) body.append(sessionCard(session));
 }
 
 function invalidateApply(message = "草稿已修改，请重新预览。") {
@@ -1214,6 +1319,7 @@ $("#run-button").addEventListener("click", async () => {
     draft: { rules: state.draft.rules, intentSure: state.draft.intentSure },
     sessions: selected,
     k,
+    includeSubagents: $("#include-subagents").checked,
     stopAfterHit: $("#stop-after-hit").checked,
   };
   $("#run-button").disabled = true;
@@ -1227,7 +1333,8 @@ $("#run-button").addEventListener("click", async () => {
     setHidden($("#summary-panel"), false);
     setHidden($("#results-panel"), false);
     const turns = result.sessions.reduce((sum, session) => sum + session.turns, 0);
-    $("#progress-text").textContent = `完成：${result.sessions.length} 个会话，${turns} 轮，${result.summary.changed} 轮变化`;
+    const childCount = result.sessions.filter(session => session.parentId).length;
+    $("#progress-text").textContent = `完成：${result.sessions.length - childCount} 个主会话，${childCount} 个子 agent，${turns} 轮，${result.summary.changed} 轮变化`;
     $("#progress-fill").style.width = "100%";
   } catch (error) {
     errorNode.textContent = error?.message || String(error);
@@ -1248,6 +1355,7 @@ $("#apply-preview").addEventListener("click", async () => {
     const data = await postApply({
       group: state.group.id,
       draft: { rules: state.draft.rules, intentSure: state.draft.intentSure },
+      baseline: state.group.rules,
       dryRun: true,
     });
     renderApplyPlan(data);
@@ -1269,6 +1377,7 @@ $("#apply-run").addEventListener("click", async () => {
     const data = await postApply({
       group: state.group.id,
       draft: { rules: state.draft.rules, intentSure: state.draft.intentSure },
+      baseline: state.group.rules,
       dryRun: false,
     });
     renderApplyResult(data);

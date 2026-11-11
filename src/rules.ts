@@ -294,9 +294,13 @@ export interface ProviderInfo {
 export interface Config {
   groups: Group[]; providers: ProviderInfo[]; modelAPIs: Record<string, string>;
 }
+function magpieConfigDir(): string {
+  const xdg = process.env.XDG_CONFIG_HOME;
+  return xdg ? join(xdg, "magpie") : join(homedir(), ".config/magpie");
+}
 export async function readConfig(
-  file = join(homedir(), ".config/magpie/providers.json"),
-  settingsFile = join(homedir(), ".config/magpie/settings.json"),
+  file = join(magpieConfigDir(), "providers.json"),
+  settingsFile = join(magpieConfigDir(), "settings.json"),
 ): Promise<Config> {
   const config = JSON.parse(await readFile(file, "utf8"));
   if (!Array.isArray(config.groups)) throw new Error("providers.json groups is not an array");
@@ -322,7 +326,7 @@ export async function readConfig(
     providers, modelAPIs,
   };
 }
-export async function readGroups(file = join(homedir(), ".config/magpie/providers.json")): Promise<Group[]> {
+export async function readGroups(file = join(magpieConfigDir(), "providers.json")): Promise<Group[]> {
   return (await readConfig(file)).groups;
 }
 const jevModel = (model: string) => model.split("/").some(seg => seg.toLowerCase() === "jev" || seg.toLowerCase().startsWith("jev-"));

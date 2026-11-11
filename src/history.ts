@@ -23,6 +23,7 @@ export interface Sample {
   prep: SamplePrep;
   features: RuleRequest; transcript: string; message: number; routing?: { id: number; time: string; group?: string };
   initialMembers: Record<string, string>;
+  parent?: string; subagentId?: string;
   prefixTokens: number; prefixEstimated: boolean;
 }
 export interface Filters {
@@ -50,19 +51,67 @@ export interface HistoryStats {
   malformedRouting: number; malformedTranscript: number; agents: Record<Agent, AgentStats>;
 }
 export interface HistoryResult { samples: Sample[]; stats: HistoryStats }
-const parsed = new Map<string, { stamp: string; value: Promise<Transcript> }>();
+const parsed = new Map<string, { stamp: string; value: Promise<Transcript>; checkedAt: number }>();
 export async function readTranscript(file: string, agent: Agent): Promise<Transcript> {
   return transcript(file, agent);
 }
 export const sessionId = (path: string): string => Buffer.from(path, "utf8").toString("base64url");
 export const sessionPath = (id: string): string => Buffer.from(id, "base64url").toString("utf8");
+const HELPER_PREFIX = "Name this chat from the user's first request";
+const helperCalls = new WeakMap<Transcript, boolean>();
+// Orca titles a chat by asking a one-turn model call. It is not a chat the
+// user had, so it stays out of the catalog, search and replay.
+export function isHelperCall(t: Transcript): boolean {
+  const known = helperCalls.get(t);
+  if (known !== undefined) return known;
+  const helper = () => {
+    if (t.agent !== "claude") return false;
+    let first = "";
+    for (const m of t.messages) {
+      if (m.Role !== "user") continue;
+      const said = userSaidDetailed(m).text;
+      if (!said) continue;
+      if (first) return false;
+      first = said.trimStart();
+      if (!first.startsWith(HELPER_PREFIX)) return false;
+    }
+    if (!first) return false;
+    const states = turnStates(t.messages);
+    let turns = 0;
+    for (let i = 0; i < t.messages.length; i++) {
+      if (t.messages[i].Role === "user" && userSaidDetailed(t.messages[i]).text && states[i].newTurn) turns++;
+    }
+    return turns === 1;
+  };
+  const value = helper();
+  helperCalls.set(t, value);
+  return value;
+}
 async function transcript(file: string, agent: Agent): Promise<Transcript> {
-  const info = await stat(file), stamp = `${info.size}:${info.mtimeMs}`;
   const old = parsed.get(file);
-  if (old?.stamp === stamp) return old.value;
+  // Tens of thousands of routing rows point at the same few hundred
+  // transcripts. One stat per file per short window keeps the catalog fast
+  // without hiding a chat that is still being written.
+  if (old && Date.now() - old.checkedAt < 15_000) return old.value;
+  const info = await stat(file), stamp = `${info.size}:${info.mtimeMs}`;
+  if (old?.stamp === stamp) {
+    old.checkedAt = Date.now();
+    return old.value;
+  }
   const value = agent === "claude" ? readClaude(file) : agent === "codex" ? readCodex(file) : readPi(file);
-  parsed.set(file, { stamp, value });
+  parsed.set(file, { stamp, value, checkedAt: Date.now() });
   try { return await value; } catch (err) { parsed.delete(file); throw err; }
+}
+async function piSessionId(file: string): Promise<string> {
+  try {
+    const text = await Bun.file(file).slice(0, 131_072).text();
+    for (const line of text.split("\n", 2)) {
+      if (!line.trim()) continue;
+      const row = JSON.parse(line);
+      if (row?.type === "session" && typeof row.id === "string" && row.id) return row.id;
+    }
+  } catch { /* fall through to the file name */ }
+  return basename(file).match(/_([0-9a-f-]{36})\.jsonl$/i)?.[1] ?? "";
 }
 export function shortFolder(dir: string): string {
   let parts = trimSpace(dir).split(/[\\/]+/).filter(Boolean);
@@ -118,11 +167,10 @@ async function readRouting(dir: string): Promise<{ routes: Route[]; malformed: n
 // subagent has its own file, and Codex names its rollout by thread id.
 function routeSessionKey(route: Route): string {
   if (route.agent === "claude") return route.subagentId || route.sub || route.session || "";
-  if (route.agent === "codex") return route.session || "";
-  return "";
+  return route.session || "";
 }
 function transcriptSessionKey(t: Transcript): string {
-  return t.agent === "claude" || t.agent === "codex" ? t.session : "";
+  return t.session;
 }
 // The account and model that actually served a routing row, as
 // provider/model. A try's id names the account or key; a "#" or "@" suffix
@@ -210,15 +258,20 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
     list.push(file);
     codexFiles.set(key, list);
   }
-  const pi = await mapLimit(files[2], 24, f => transcript(f, "pi"));
+  // A pi transcript names itself in its first session row; reading that is
+  // far cheaper than parsing every session file just to match routing rows.
+  const piPaths = new Map<string, string>();
+  await mapLimit(files[2], 24, async file => {
+    const id = await piSessionId(file);
+    if (id && !piPaths.has(id)) piPaths.set(id, file);
+  });
   const linked = new Map<string, { t: Transcript; routes: Route[] }>();
   await mapLimit(routes, 24, async route => {
     const s = stats.agents[route.agent]; s.routingRecords++; stats.routingRecords++;
     let candidates: Transcript[];
     if (route.agent === "pi") {
-      const at = Date.parse(route.time);
-      // A routing request starts between the user's message and its assistant reply.
-      candidates = pi.filter(t => t.start <= at && at <= t.end && sameFolder(route, t));
+      const path = route.session ? piPaths.get(route.session) : undefined;
+      candidates = path ? [await transcript(path, "pi")] : [];
     } else {
       const paths = route.agent === "claude"
         ? claudeFiles.get(route.subagentId || route.sub ? `agent-${route.subagentId || route.sub}` : route.session || "") ?? []
@@ -229,10 +282,33 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
     if (candidates.length > 1) { s.ambiguous++; return; }
     if (candidates.length !== 1) return;
     const t = candidates[0];
+    if (isHelperCall(t)) return;
+    if (t.agent === "codex" && t.parentKey && !t.parentPath) {
+      t.parentPath = codexFiles.get(t.parentKey)?.[0];
+    }
     s.linkedRecords++; stats.linkedRecords++;
     const old = linked.get(t.path);
     if (old) old.routes.push(route); else linked.set(t.path, { t, routes: [route] });
   });
+  // A selected subagent may have no routing rows of its own; it still has
+  // turns to replay, with an unknown initial member.
+  if (wantedPaths) {
+    const agentOfPath = new Map<string, Agent>();
+    files[0].forEach(path => agentOfPath.set(path, "claude"));
+    files[1].forEach(path => agentOfPath.set(path, "codex"));
+    files[2].forEach(path => agentOfPath.set(path, "pi"));
+    for (const path of wantedPaths) {
+      if (linked.has(path)) continue;
+      const agent = agentOfPath.get(path);
+      if (!agent) continue;
+      const t = await transcript(path, agent);
+      if (isHelperCall(t)) continue;
+      if (t.agent === "codex" && t.parentKey && !t.parentPath) {
+        t.parentPath = codexFiles.get(t.parentKey)?.[0];
+      }
+      linked.set(path, { t, routes: [] });
+    }
+  }
   let all: Sample[] = [];
   for (const { t, routes: attached } of linked.values()) {
     const s = stats.agents[t.agent]; s.transcripts++; stats.transcripts++; stats.malformedTranscript += t.malformed;
@@ -295,6 +371,7 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
         features: { agent: t.agent, folder: m.cwd || t.cwd, time: m.time, message: text },
         transcript: t.path, message: i,
         initialMembers,
+        parent: t.parentPath, subagentId: t.subagentId,
         prefixTokens: 0, prefixEstimated: true,
       };
       turns.push({ sample, at: Date.parse(m.time), prefixChars });

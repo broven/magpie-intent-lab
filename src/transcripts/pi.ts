@@ -1,8 +1,15 @@
+import { dirname } from "node:path";
 import { emptyTranscript, finish, jsonLines, parts, textOf, timestamp } from "./common";
 
 export async function readPi(file: string) {
   const t = emptyTranscript("pi", file);
   const seen = new Set<string>();
+  // A pi subagent lives at <project>/<parent-stem>/<subagent-id>/run-N/session.jsonl.
+  const sub = /[/\\]([^/\\]+)[/\\]([^/\\]+)[/\\]run-[^/\\]+[/\\]session\.jsonl$/.exec(file);
+  if (sub) {
+    t.subagentId = sub[2];
+    t.parentPath = dirname(dirname(dirname(file))) + ".jsonl";
+  }
   for await (const { row, malformed } of jsonLines(file)) {
     if (malformed) { t.malformed++; continue; }
     if (row.type === "session") {

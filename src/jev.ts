@@ -3,6 +3,7 @@ import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Before } from "./textprep";
+import pkg from "../package.json";
 
 // String constants and decision semantics: gateway/decide.go:37-427.
 export const jevSure = 0.4;
@@ -197,7 +198,11 @@ export class JevClient {
     const call = slot(async () => {
       this.stats.requests++;
       if (meter) meter.requests++;
-      const res = await fetch(this.url, { method: "POST", headers: { "content-type": "application/json" }, body: bytes, signal: AbortSignal.timeout(120_000) });
+      const res = await fetch(this.url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "user-agent": `magpie-intent-lab/${pkg.version}` },
+        body: bytes, signal: AbortSignal.timeout(120_000),
+      });
       if (!res.ok) throw new Error(`Jev HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
       const answer = await res.json() as JevAnswer;
       if (!answer || !answer.answers || typeof answer.answers !== "object" || Array.isArray(answer.answers)) throw new Error("not a System One answer");

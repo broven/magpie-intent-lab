@@ -67,9 +67,11 @@ try {
 
   browser = await launch();
   const page = await browser.newPage({ viewport: { width: 1100, height: 900 }, colorScheme: "light" });
-  await page.goto(base + "/", { waitUntil: "networkidle" });
+  // The session list is the page's readiness signal: the cold samples read
+  // can keep a request open for minutes, so networkidle never comes.
+  await page.goto(base + "/", { waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="group-select"] option').length > 0);
-  await page.waitForSelector("#session-list .session-card", { timeout: 60_000 });
+  await page.waitForSelector("#session-list .session-card", { timeout: 600_000 });
 
   await page.setViewportSize({ width: 1100, height: 900 });
   await page.screenshot({ path: join(artifactDir, "ui-1100.png"), fullPage: true });
@@ -120,16 +122,25 @@ try {
   await page.click('[data-testid="session-select-none"]');
   const boxes = await page.$$('[data-testid="session-checkbox"]');
   if (boxes.length < 3) throw new Error(`need at least 3 sessions for screenshots, got ${boxes.length}`);
-  for (const box of boxes.slice(0, 3)) await box.check();
+  const subagentSession = await page.$$eval('[data-testid="session-subagents"]', (nodes: any[]) => {
+    const card = nodes[0]?.closest(".session-card");
+    return card?.dataset.sessionId ?? "";
+  });
+  if (!subagentSession) throw new Error("no catalog entry shows 含 N 个子 agent");
+  const ids = await page.$$eval('[data-testid="session-checkbox"]', (nodes: any[]) => nodes.map(node => node.dataset.sessionId));
+  for (const id of [subagentSession, ...ids.filter((id: string) => id !== subagentSession).slice(0, 2)]) {
+    await page.locator(`[data-testid="session-checkbox"][data-session-id="${id}"]`).check();
+  }
   const selected = await page.evaluate(() => state.selectedSessions.size);
   if (selected !== 3) throw new Error(`expected 3 selected sessions, got ${selected}`);
   await page.click('[data-testid="run-button"]');
   await page.waitForFunction(
     () => document.querySelectorAll('[data-testid="session-result"]').length === 3,
     undefined,
-    { timeout: 300_000 },
+    { timeout: 600_000 },
   );
   await page.waitForSelector('[data-testid="turn-cell"]', { timeout: 10_000 });
+  await page.waitForSelector('[data-testid="subagent-summary"]', { timeout: 60_000 });
   await page.locator("#results-panel").screenshot({ path: join(artifactDir, "main-1100.png") });
   console.log("PASS main-1100.png");
   await page.setViewportSize({ width: 420, height: 900 });
@@ -137,18 +148,32 @@ try {
   await page.locator("#results-panel").screenshot({ path: join(artifactDir, "main-420.png") });
   console.log("PASS main-420.png", JSON.stringify(main420));
 
+  const parentCard = page.locator('#session-results .session-result').filter({ has: page.locator('[data-testid="subagent-summary"]') }).first();
   await page.setViewportSize({ width: 1100, height: 900 });
-  await page.click('[data-testid="session-result-head"]');
-  await page.waitForSelector('[data-testid="turn-row"]', { timeout: 10_000 });
-  const expanded = page.locator("#session-results .session-result").first();
-  await expanded.screenshot({ path: join(artifactDir, "expanded-1100.png") });
+  await parentCard.locator('[data-testid="session-result-head"]').first().click();
+  const parentTurns = parentCard.locator('[data-testid="session-turns"]').last();
+  await parentTurns.locator('[data-testid="turn-row"]').first().waitFor({ state: "visible", timeout: 10_000 });
+  await parentCard.locator('[data-testid="subagent-summary"] > summary').click();
+  await page.waitForSelector('[data-testid="subagent-result"]', { timeout: 10_000 });
+  await parentCard.screenshot({ path: join(artifactDir, "expanded-1100.png") });
   console.log("PASS expanded-1100.png");
   await page.setViewportSize({ width: 420, height: 900 });
   const expanded420 = await noHorizontalScroll(page, 420);
-  await expanded.screenshot({ path: join(artifactDir, "expanded-420.png") });
+  await parentCard.screenshot({ path: join(artifactDir, "expanded-420.png") });
   console.log("PASS expanded-420.png", JSON.stringify(expanded420));
 
-  const shots = ["ui-1100.png", "ui-420.png", "ui-1100-dark.png", "ui-420-dark.png", "logic-1100.png", "logic-420.png", "panel-1100.png", "panel-420.png", "main-1100.png", "main-420.png", "expanded-1100.png", "expanded-420.png"];
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await parentCard.locator('[data-testid="session-preview-result"]').click();
+  await page.waitForSelector('[data-testid="preview-subagent"]', { timeout: 60_000 });
+  const dialog = page.locator("#session-modal .modal-dialog");
+  await dialog.screenshot({ path: join(artifactDir, "preview-1100.png") });
+  console.log("PASS preview-1100.png");
+  await page.setViewportSize({ width: 420, height: 900 });
+  const preview420 = await noHorizontalScroll(page, 420);
+  await dialog.screenshot({ path: join(artifactDir, "preview-420.png") });
+  console.log("PASS preview-420.png", JSON.stringify(preview420));
+
+  const shots = ["ui-1100.png", "ui-420.png", "ui-1100-dark.png", "ui-420-dark.png", "logic-1100.png", "logic-420.png", "panel-1100.png", "panel-420.png", "main-1100.png", "main-420.png", "expanded-1100.png", "expanded-420.png", "preview-1100.png", "preview-420.png"];
   console.log(`artifacts: ${shots.map(name => join(artifactDir, name)).join(", ")}`);
 } finally {
   if (browser) await browser.close();

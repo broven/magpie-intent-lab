@@ -2,9 +2,10 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { assistantSaid, cutMiddle, trimSpace, turnStates, userSaidDetailed } from "./textprep";
-import { readHistory, readTranscript, sessionId, sessionPath, type Filters, type Sample } from "./history";
+import { isHelperCall, readHistory, readTranscript, sessionId, sessionPath, type Filters, type Sample } from "./history";
+import { sessionFiles, subagentsOf, type SessionFile } from "./sessiontree";
 import { bashEvents, type BashEvent } from "./transcripts/bash";
-import type { Agent, Transcript } from "./transcripts/common";
+import { mapLimit, type Agent, type Transcript } from "./transcripts/common";
 
 export type SearchScope = "first" | "user" | "reply" | "bash";
 export const searchScopes: SearchScope[] = ["first", "user", "reply", "bash"];
@@ -16,6 +17,7 @@ export interface SearchSnippet {
   end: number;
   lead: boolean;
   trail: boolean;
+  subagent?: string;
 }
 export interface SessionSummary {
   id: string;
@@ -28,6 +30,7 @@ export interface SessionSummary {
   hits: number;
   snippets: SearchSnippet[];
   turns: number;
+  subagents: number;
 }
 export interface SessionSearch {
   q?: string;
@@ -53,6 +56,15 @@ export interface PreviewItem {
   sampleId?: string;
   message?: number;
 }
+export interface PreviewSubagent {
+  id: string;
+  subagentId: string;
+  agent: Agent;
+  first: string;
+  start: string;
+  end: string;
+  turnCount: number;
+}
 export interface SessionPreview {
   id: string;
   agent: Agent;
@@ -63,6 +75,7 @@ export interface SessionPreview {
   turnCount: number;
   items: PreviewItem[];
   focus: number;
+  subagents: PreviewSubagent[];
 }
 
 const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -73,7 +86,25 @@ const historyCache = new Map<string, { at: number; value: ReturnType<typeof read
 // A catalog read parses every transcript; keep it warm across a search and
 // its follow-up scopes. Transcript parsing itself stays mtime-cached.
 const HISTORY_TTL = 5 * 60_000;
-async function historyFor(filters: Filters, home: string) {
+// Build every scope's searchable text for every transcript. The start-up
+// warm-up does this in the background so the first full-scope search is not
+// the one paying for user/reply/bash extraction.
+export async function warmSearchTexts(home = homedir()): Promise<void> {
+  const history = await historyFor({ limit: 10_000, all: true }, home);
+  const index = await sessionFiles(home);
+  const seen = new Set<string>();
+  const warm = async (path: string, agent: Agent) => {
+    if (seen.has(path)) return;
+    seen.add(path);
+    try {
+      const t = await readTranscript(path, agent);
+      for (const scope of searchScopes) textsFor(t, scope);
+    } catch { /* one unreadable file must not stop the rest */ }
+  };
+  for (const sample of history.samples) await warm(sample.session, sample.agent);
+  for (const file of index) await warm(file.path, file.agent);
+}
+export async function historyFor(filters: Filters, home = homedir()) {
   const key = JSON.stringify([filters.agents ?? "", filters.from ?? "", filters.to ?? "", home]);
   const old = historyCache.get(key);
   if (old && Date.now() - old.at < HISTORY_TTL) {
@@ -102,7 +133,7 @@ function matches(text: string, re: RegExp): { start: number; end: number }[] {
   }
   return out;
 }
-function snippet(text: string, hit: { start: number; end: number }, scope: SearchScope): SearchSnippet {
+function snippet(text: string, hit: { start: number; end: number }, scope: SearchScope, subagent?: string): SearchSnippet {
   const start = Math.max(0, hit.start - 90), end = Math.min(text.length, hit.end + 90);
   return {
     scope,
@@ -111,6 +142,7 @@ function snippet(text: string, hit: { start: number; end: number }, scope: Searc
     end: hit.end - start,
     lead: start > 0,
     trail: end < text.length,
+    ...(subagent ? { subagent } : {}),
   };
 }
 function clip(text: string, limit: number): string {
@@ -195,38 +227,86 @@ export async function searchSessions(query: SessionSearch, home = homedir()): Pr
   // The catalog always reads every turn of a session. A date range picks the
   // sessions by their last turn; it must not cut the replayed session short.
   const history = await historyFor({ agents: query.agents, limit: 10_000, all: true }, home);
-  const bySession = new Map<string, Sample[]>();
+  const index = await sessionFiles(home);
+  const byPath = new Map(index.map(file => [file.path, file]));
+  const rootCache = new Map<string, string>();
+  const rootOf = (path: string): string => {
+    const cached = rootCache.get(path);
+    if (cached !== undefined) return cached;
+    let file = byPath.get(path), root = "";
+    if (!file) { rootCache.set(path, ""); return ""; }
+    const seen = new Set<string>();
+    while (file.parentPath && !seen.has(file.path)) {
+      seen.add(file.path);
+      const parent = byPath.get(file.parentPath);
+      if (!parent) { root = file.parentPath; break; }
+      file = parent;
+    }
+    if (!root) root = file.path;
+    rootCache.set(path, root);
+    return root;
+  };
+  const filesByRoot = new Map<string, SessionFile[]>();
+  for (const file of index) {
+    const root = rootOf(file.path);
+    if (!root) continue;
+    const list = filesByRoot.get(root);
+    if (list) list.push(file); else filesByRoot.set(root, [file]);
+  }
+  const byRoot = new Map<string, Sample[]>();
   for (const sample of history.samples) {
-    const list = bySession.get(sample.session);
-    if (list) list.push(sample); else bySession.set(sample.session, [sample]);
+    const root = rootOf(sample.session);
+    if (!root) continue;
+    const list = byRoot.get(root);
+    if (list) list.push(sample); else byRoot.set(root, [sample]);
   }
   const sessions: SessionSummary[] = [];
-  for (const [path, samples] of bySession) {
-    const lastTurn = samples.at(-1)?.time ?? "";
+  for (const [root, samples] of byRoot) {
+    const rootFile = byPath.get(root);
+    // An orphan subagent has no main session to show; never list its path.
+    if (!rootFile || rootFile.parentPath) continue;
+    const own = samples.filter(sample => sample.session === root);
+    if (!own.length) continue;
+    const subs = (filesByRoot.get(root) ?? []).filter(file => file.path !== root);
+    let lastTurn = own[0].time;
+    for (const sample of samples) if (sample.time > lastTurn) lastTurn = sample.time;
+    // A subagent with no routing samples still has turns; its file time keeps
+    // the entry's "last turn" honest without parsing every subagent.
+    for (const sub of subs) if (sub.mtime && sub.mtime > lastTurn) lastTurn = sub.mtime;
     const at = Date.parse(lastTurn);
     if (!(at >= selected.from && at <= selected.to)) continue;
-    const agent = samples[0].agent;
-    const t = await readTranscript(path, agent);
+    const agent = rootFile.agent;
+    const t = await readTranscript(root, agent);
+    if (isHelperCall(t)) continue;
     let hits = 0;
     const snippets: SearchSnippet[] = [];
     if (q && re) {
-      for (const item of searchTexts(t, scopes)) {
-        const found = matches(item.text, re);
-        hits += found.length;
-        for (const hit of found) {
-          if (snippets.length < 3) snippets.push(snippet(item.text, hit, item.scope));
+      const targets: { t: Transcript; subagent?: string }[] = [{ t }];
+      for (const sub of subs) {
+        try {
+          const child = await readTranscript(sub.path, sub.agent);
+          if (!isHelperCall(child)) targets.push({ t: child, subagent: sub.subagentId ?? sub.key });
+        } catch { /* a broken subagent must not hide its parent */ }
+      }
+      for (const target of targets) {
+        for (const item of searchTexts(target.t, scopes)) {
+          const found = matches(item.text, re);
+          hits += found.length;
+          for (const hit of found) {
+            if (snippets.length < 3) snippets.push(snippet(item.text, hit, item.scope, target.subagent));
+          }
         }
       }
       if (!hits) continue;
     }
     const first = firstUser(t);
     sessions.push({
-      id: sessionId(path), agent, folder: t.cwd || samples[0].folder,
-      start: t.start ? new Date(t.start).toISOString() : samples[0].time,
+      id: sessionId(root), agent, folder: t.cwd || own[0].folder,
+      start: t.start ? new Date(t.start).toISOString() : own[0].time,
       end: t.end ? new Date(t.end).toISOString() : lastTurn,
       lastTurn,
       first: cutMiddle(first, 240, 0),
-      hits, snippets, turns: samples.length,
+      hits, snippets, turns: own.length, subagents: subs.length,
     });
   }
   sessions.sort((a, b) => (q ? b.hits - a.hits : 0) || b.lastTurn.localeCompare(a.lastTurn) || a.id.localeCompare(b.id));
@@ -289,12 +369,31 @@ export async function sessionPreview(
   items.sort((a, b) => a.time.localeCompare(b.time) || order[a.kind] - order[b.kind]);
   const first = firstUser(t);
   const focus = options.sample ? items.findIndex(item => item.sampleId === options.sample) : -1;
+  const children = await subagentsOf(path, home);
+  const subagents = (await mapLimit(children, 8, async sub => {
+    try {
+      const child = await readTranscript(sub.path, sub.agent);
+      if (isHelperCall(child)) return null;
+      const childStates = turnStates(child.messages);
+      let turns = 0;
+      for (let i = 0; i < child.messages.length; i++) {
+        if (child.messages[i].Role === "user" && userSaidDetailed(child.messages[i]).text && childStates[i].newTurn) turns++;
+      }
+      return {
+        id: sessionId(sub.path), subagentId: sub.subagentId ?? sub.key, agent: sub.agent,
+        first: cutMiddle(firstUser(child), 240, 0),
+        start: child.start ? new Date(child.start).toISOString() : "",
+        end: child.end ? new Date(child.end).toISOString() : "",
+        turnCount: turns,
+      };
+    } catch { return null; }
+  })).filter((item): item is PreviewSubagent => !!item);
   return {
     id, agent, folder: t.cwd,
     start: t.start ? new Date(t.start).toISOString() : "",
     end: t.end ? new Date(t.end).toISOString() : "",
     first,
     turnCount: items.filter(item => item.sampleId).length,
-    items, focus,
+    items, focus, subagents,
   };
 }

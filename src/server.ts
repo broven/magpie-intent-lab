@@ -1,10 +1,11 @@
 import { readConfig, classifierSupport, type Group } from "./rules";
-import { readHistory, sessionId, sessionPath, type Filters } from "./history";
+import { readHistory, sessionId, sessionPath } from "./history";
 import { replay } from "./replay";
 import { JevClient } from "./jev";
 import { planApply, type ApplyPlan } from "./apply";
 import { logicFor } from "./logic";
-import { searchSessions, sessionPreview } from "./sessions";
+import { historyFor, searchSessions, sessionPreview, warmSearchTexts } from "./sessions";
+import { subagentsOf } from "./sessiontree";
 import { dirname, extname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -217,13 +218,17 @@ function makeFetch(jev: JevClient, magpieBin: string) {
         return json({ groups });
       }
       if (request.method === "GET" && url.pathname === "/api/samples") {
-        const filters: Filters = {
+        const limit = url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : 200;
+        if (!Number.isInteger(limit) || limit < 1 || limit > 10_000) throw new Error("limit 必须是 1…10000 的整数");
+        // Share the start-up warm-up's single full read instead of starting a
+        // second one: both the panel and the catalog need every sample.
+        const history = await historyFor({
           agents: url.searchParams.get("agents") ?? undefined,
           from: url.searchParams.get("from") ?? undefined,
           to: url.searchParams.get("to") ?? undefined,
-          limit: url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined,
-        };
-        return json(await readHistory(filters));
+          limit: 10_000, all: true,
+        });
+        return json({ ...history, samples: history.samples.slice(-limit) });
       }
       if (request.method === "GET" && url.pathname === "/api/sessions") {
         try {
@@ -276,17 +281,26 @@ function makeFetch(jev: JevClient, magpieBin: string) {
         if (body?.stopAfterHit !== undefined && typeof body.stopAfterHit !== "boolean") {
           return failure(400, "stopAfterHit 必须是布尔值");
         }
-        const sessions = body.sessions.map((id: string) => sessionPath(id));
+        if (body?.includeSubagents !== undefined && typeof body.includeSubagents !== "boolean") {
+          return failure(400, "includeSubagents 必须是布尔值");
+        }
+        const roots = body.sessions.map((id: string) => sessionPath(id));
+        const includeSubagents = body?.includeSubagents !== false;
         const encoder = new TextEncoder();
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
             (async () => {
               try {
                 sse(controller, encoder, "progress", { done: 0, total: 0, phase: "history" });
+                const paths = [...roots];
+                if (includeSubagents) {
+                  for (const root of roots) for (const sub of await subagentsOf(root)) paths.push(sub.path);
+                }
+                const sessions = [...new Set(paths)];
                 const history = await readHistory({ sessions, limit: 10_000, all: true });
                 if (!history.samples.length) throw new Error("选中的会话没有可回测的轮次");
                 const got = new Set(history.samples.map(sample => sample.session));
-                const missing = sessions.filter(path => !got.has(path));
+                const missing = roots.filter(path => !got.has(path));
                 if (missing.length) throw new Error(`会话没有可回测的轮次: ${missing.map(path => sessionId(path)).join(", ")}`);
                 sse(controller, encoder, "progress", { done: 0, total: history.samples.length, phase: "replay" });
                 const result = await replay(jev, group!, group!, draft, history.samples, (done, total) => {
@@ -315,9 +329,10 @@ function makeFetch(jev: JevClient, magpieBin: string) {
         const config = await readConfig();
         const group = config.groups.find(g => g.id === body?.group);
         if (!group) return failure(400, `未知组 ${body?.group}`);
+        if (body?.baseline !== undefined && !Array.isArray(body.baseline)) return failure(400, "baseline 必须是规则数组");
         let draft: Group;
         try { draft = draftFor(group, body?.draft); } catch (err: any) { return failure(400, err.message ?? String(err)); }
-        const plan = planApply(group, draft, magpieBin);
+        const plan = planApply(group, draft, magpieBin, body?.baseline);
         if (body?.dryRun !== false) {
           return json({ ...plan, ok: !plan.error, executed: [] }, plan.error && plan.commands.length === 0 ? 400 : 200);
         }
@@ -350,10 +365,13 @@ export async function startService(options: ServiceOptions = {}): Promise<Runnin
       const server = Bun.serve({ hostname: "127.0.0.1", port: requested, idleTimeout: 255, fetch: guarded(makeFetch(jev, bin)) });
       const port = server.port ?? requested;
       if (options.log !== false) console.log(`intent-lab listening http://127.0.0.1:${port}`);
-      // Warm the transcript parse cache in the background, so the first
-      // search the user makes isn't the cold one (~8s over ~500 sessions).
+      // Warm the transcript parse cache in the background. The first history
+      // read is the cold one; a catalog/search made after this shares it.
+      // Search text extraction runs after it, so /api/samples is not delayed.
       if (options.warm !== false) {
-        searchSessions({ q: "\u0000warm", scopes: ["first", "user", "reply", "bash"], limit: 1 })
+        historyFor({ limit: 10_000, all: true })
+          .then(() => Bun.sleep(100))
+          .then(() => warmSearchTexts())
           .catch(err => console.error(`[intent-lab] warm-up failed: ${err?.message ?? err}`));
       }
       return { server, port, jev };

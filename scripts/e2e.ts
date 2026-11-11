@@ -1,10 +1,11 @@
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readHistory, readTranscript } from "../src/history";
+import { readHistory, readTranscript, sessionPath } from "../src/history";
+import { sessionFiles } from "../src/sessiontree";
 import { turnIn, userSaid } from "../src/textprep";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -23,12 +24,27 @@ const sandboxHome = join(sandbox, "home");
 await mkdir(join(sandbox, "magpie"), { recursive: true, mode: 0o700 });
 await mkdir(sandboxHome, { recursive: true, mode: 0o700 });
 await copyFile(configFile, join(sandbox, "magpie/providers.json"));
+// The plugin must read the same config the CLI writes. Seed the sandbox with
+// a compact rule when the real group has none, so the write-back path always
+// exercises a non-intent rule; the real config stays untouched.
+const sandboxConfigFile = join(sandbox, "magpie/providers.json");
+const sandboxConfig = JSON.parse(await readFile(sandboxConfigFile, "utf8"));
+const seedGroup = (sandboxConfig.groups ?? []).find((g: any) => g?.id === "claude-opus");
+let seededCompact: any = null;
+if (seedGroup && !(seedGroup.rules ?? []).some((rule: any) => rule?.compact)) {
+  const use = (seedGroup.members ?? [])[0];
+  if (use) {
+    seededCompact = { use, compact: true };
+    seedGroup.rules = [seededCompact, ...(seedGroup.rules ?? [])];
+    await writeFile(sandboxConfigFile, JSON.stringify(sandboxConfig, null, 2) + "\n");
+  }
+}
 const cliEnv = { XDG_CONFIG_HOME: sandbox, HOME: sandboxHome };
 
-const artifact: any = { started: new Date().toISOString(), checks: [], configBefore, sandbox: { xdg: sandbox, home: sandboxHome } };
+const artifact: any = { started: new Date().toISOString(), checks: [], configBefore, sandbox: { xdg: sandbox, home: sandboxHome, seededCompact } };
 const child = Bun.spawn([process.execPath, join(root, "src/server.ts")], {
   cwd: root,
-  env: { ...process.env, INTENT_LAB_PORT: "0", INTENT_LAB_MAGPIE_ENV: JSON.stringify(cliEnv) },
+  env: { ...process.env, INTENT_LAB_PORT: "0", INTENT_LAB_MAGPIE_ENV: JSON.stringify(cliEnv), XDG_CONFIG_HOME: sandbox },
   stdout: "pipe",
   stderr: "inherit",
 });
@@ -55,14 +71,18 @@ function check(label: string, detail: unknown) {
   console.log(`PASS ${label}`);
 }
 async function json(path: string, body?: unknown) {
-  const response = await fetch(base + path, body === undefined ? { headers: auth() } : {
-    method: "POST", headers: { "content-type": "application/json", ...auth() }, body: JSON.stringify(body),
+  // The first samples request shares the start-up read of every routed
+  // transcript. A large home can take minutes; Bun's default fetch timeout is
+  // five, shorter than that cold read.
+  const signal = AbortSignal.timeout(900_000);
+  const response = await fetch(base + path, body === undefined ? { headers: auth(), signal } : {
+    method: "POST", headers: { "content-type": "application/json", ...auth() }, body: JSON.stringify(body), signal,
   });
   if (!response.ok) throw Error(`${path}: HTTP ${response.status} ${await response.text()}`);
   return response.json() as Promise<any>;
 }
 async function runAt(urlBase: string, tokenValue: string, body: unknown) {
-  const response = await fetch(urlBase + "/api/run", { method: "POST", headers: { "content-type": "application/json", "x-intent-lab-token": tokenValue }, body: JSON.stringify(body) });
+  const response = await fetch(urlBase + "/api/run", { method: "POST", headers: { "content-type": "application/json", "x-intent-lab-token": tokenValue }, body: JSON.stringify(body), signal: AbortSignal.timeout(900_000) });
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
   const events: any[] = [];
@@ -97,6 +117,7 @@ async function startLab(cacheDir: string) {
     env: {
       ...process.env, INTENT_LAB_PORT: "0",
       INTENT_LAB_MAGPIE_ENV: JSON.stringify(cliEnv),
+      XDG_CONFIG_HOME: sandbox,
       INTENT_LAB_DIR: cacheDir,
     },
     stdout: "pipe",
@@ -147,6 +168,7 @@ try {
   assert.ok(group, "claude-opus must be present");
   assert.equal(group.supported, true, group.reason);
   artifact.group = group;
+  assert.equal(await digest(), configBefore, "real config changed while the e2e was starting; rerun against a stable config");
   check("1 groups includes claude-opus", { classifier: group.classifier });
   const samples = await json("/api/samples?limit=30");
   assert.ok(samples.samples.length >= 1);
@@ -175,6 +197,24 @@ try {
     first: firstPage.sessions[0].lastTurn, last: firstPage.sessions.at(-1).lastTurn,
   });
 
+  // F-1: one catalog entry per main session. Subagent transcripts and Orca's
+  // title helper calls must not appear as chats of their own.
+  const fCatalog = await json("/api/sessions?limit=30");
+  artifact.catalogF = fCatalog;
+  assert.ok(fCatalog.sessions.length > 0, "F-1 catalog must have entries");
+  for (const session of fCatalog.sessions) {
+    const path = sessionPath(session.id);
+    assert.ok(!path.includes("/subagents/"), `catalog entry must not be a subagent transcript: ${path}`);
+    assert.ok(!(session.turns === 1 && (session.first ?? "").trimStart().startsWith("Name this chat from the user's first request")), `catalog entry must not be a title helper call: ${path}`);
+    assert.ok(Number.isInteger(session.subagents) && session.subagents >= 0, `catalog entry needs a subagent count: ${path}`);
+  }
+  const fParent = fCatalog.sessions.find((session: any) => sessionPath(session.id).includes("06d555c1-40da-4c28-a0a3-b1d15f76b8e7.jsonl"));
+  assert.ok(fParent, "F-1 must list the current main session");
+  assert.ok(fParent.subagents >= 1, `F-1 current session must report its subagents, got ${fParent.subagents}`);
+  check("F-1 catalog: main sessions only, subagents counted, helpers excluded", {
+    sessions: fCatalog.sessions.length, parentSubagents: fParent.subagents,
+  });
+
   const catalog = await json("/api/sessions?limit=100");
   const multi = catalog.sessions.filter((session: any) => session.turns > 1).slice(0, 3);
   assert.equal(multi.length, 3, "the catalog must hold at least 3 multi-turn sessions");
@@ -182,7 +222,7 @@ try {
   assert.ok(single, "the catalog must hold a single-turn session");
   artifact.catalogPicked = { multi: multi.map((session: any) => ({ id: session.id, turns: session.turns })), single: { id: single.id, turns: single.turns } };
   const draft = { rules: structuredClone(group.rules), intentSure: group.intentSure };
-  const same = await run({ group: group.id, draft, sessions: multi.map((session: any) => session.id), k: 3, stopAfterHit: false });
+  const same = await run({ group: group.id, draft, sessions: multi.map((session: any) => session.id), k: 3, includeSubagents: false, stopAfterHit: false });
   artifact.identical = same;
   const sameRows = same.result.sessions.flatMap((session: any) => session.rows);
   assert.ok(sameRows.length >= 1);
@@ -207,19 +247,43 @@ try {
 
   const edited = structuredClone(draft);
   for (const rule of edited.rules) if (rule.intent) rule.intent = "写代码或改代码";
-  const changed = await run({ group: group.id, draft: edited, sessions: multi.map((session: any) => session.id), k: 3, stopAfterHit: false });
+  const changed = await run({ group: group.id, draft: edited, sessions: multi.map((session: any) => session.id), k: 3, includeSubagents: false, stopAfterHit: false });
   artifact.edited = changed;
   const changedRows = changed.result.sessions.flatMap((session: any) => session.rows);
   assert.ok(changedRows.some((r: any) => r.changed === true), "edited intent must change at least one row");
   assert.ok(changed.result.summary.changed > 0);
   check(`4 edited intent changed=${changed.result.summary.changed}`, { rows: changedRows.length, cache: changed.result.cache });
-  const commands = await json("/api/apply", { group: group.id, draft: edited, dryRun: true });
+  const commands = await json("/api/apply", { group: group.id, baseline: group.rules, draft: edited, dryRun: true });
   artifact.apply = commands;
   assert.ok(Array.isArray(commands.commands) && commands.commands.length > 0);
   assert.ok(commands.commands.some((c: string) => /group rule rm/.test(c)));
   assert.ok(commands.commands.some((c: string) => /group rule add/.test(c) && c.includes("写代码或改代码") && c.includes("at=")));
-  check("5 apply dryRun commands", { commands: commands.commands.length });
-  const real = await json("/api/apply", { group: group.id, draft: edited, dryRun: false });
+  // Only the rule the draft changed may be touched. A non-intent rule (such
+  // as compact) has to keep its use, its position and its CLI spelling.
+  const changedRules = edited.rules
+    .map((rule: any, index: number) => ({ rule, index }))
+    .filter(({ rule, index }: any) => JSON.stringify(rule) !== JSON.stringify(group.rules[index]));
+  assert.equal(changedRules.length, 1, "this draft must change exactly one rule");
+  const changedAt = changedRules[0].index + 1;
+  for (const command of commands.commands) {
+    const rm = / group rule rm [^ ]+ (\d+)$/.exec(command);
+    const add = / at=(\d+)$/.exec(command);
+    const at = rm ? Number(rm[1]) : add ? Number(add[1]) : null;
+    assert.equal(at, changedAt, `apply must touch only rule ${changedAt}: ${command}`);
+  }
+  assert.ok(!commands.commands.some((c: string) => /compact/.test(c)), "unchanged compact rule must not be rewritten");
+  // A draft made from older rules must never delete rules that appeared since.
+  const staleBaseline = group.rules.slice(0, Math.max(0, group.rules.length - 1));
+  const staleResponse = await fetch(base + "/api/apply", {
+    method: "POST", headers: { "content-type": "application/json", ...auth() },
+    body: JSON.stringify({ group: group.id, baseline: staleBaseline, draft: edited, dryRun: true }),
+  });
+  assert.equal(staleResponse.status, 400, "a changed group must refuse the stale draft");
+  const stale = await staleResponse.json() as any;
+  assert.match(stale.error ?? "", /加载后变化/, "the refusal must name the changed group");
+  assert.equal((stale.commands ?? []).length, 0, "the stale draft must not produce commands");
+  check("5 apply dryRun commands", { commands: commands.commands.length, changedRule: changedAt, staleRefused: true });
+  const real = await json("/api/apply", { group: group.id, baseline: group.rules, draft: edited, dryRun: false });
   artifact.applyReal = {
     ok: real.ok,
     commands: real.commands,
@@ -231,13 +295,27 @@ try {
   assert.equal(real.ok, true, real.error);
   assert.ok(Array.isArray(real.executed) && real.executed.length > 0, "real apply must execute commands");
   assert.match(real.readBack ?? "", /写代码或改代码/, "readback must contain the new intent");
-  const sandboxConfig = await readFile(join(sandbox, "magpie/providers.json"), "utf8");
-  assert.match(sandboxConfig, /写代码或改代码/, "the sandbox providers.json must have changed");
+  const sandboxConfig = JSON.parse(await readFile(join(sandbox, "magpie/providers.json"), "utf8"));
+  const sandboxGroup = sandboxConfig.groups.find((g: any) => g.id === group.id);
+  assert.ok(sandboxGroup, "the sandbox config must still hold the written group");
+  // The read-back order must equal the draft byte for byte (in rule order),
+  // including rules the draft never touched.
+  assert.deepEqual(sandboxGroup.rules, edited.rules, "read-back rules must equal the draft and preserve order");
+  const preserved = group.rules.filter((rule: any) => !rule.intent);
+  assert.ok(preserved.length >= 1, "step 6 needs a group with a non-intent (e.g. compact) rule");
+  for (const rule of preserved) {
+    const at = group.rules.indexOf(rule);
+    assert.deepEqual(sandboxGroup.rules[at], rule, `non-intent rule ${at + 1} must keep its use and position`);
+  }
+  const changedRule = sandboxGroup.rules[changedAt - 1];
+  assert.equal(changedRule.intent, "写代码或改代码", `rule ${changedAt} must be the new intent`);
+  assert.match(real.readBack ?? "", /compacting[\s\S]*写代码或改代码/, "readback must keep the compact rule before the new intent");
   artifact.configAfter = await digest();
   assert.equal(artifact.configAfter, configBefore, "real configuration must remain byte-for-byte unchanged");
-  check("6 sandboxed real apply; readback has new intent; real config unchanged", {
+  check("6 sandboxed real apply; non-intent rule preserved; order equals draft; real config unchanged", {
     executed: real.executed.length,
-    readBack: real.readBack.split("\n").filter(Boolean).slice(0, 3),
+    rules: sandboxGroup.rules,
+    readBack: real.readBack.split("\n").filter(Boolean).slice(0, 5),
   });
   const html = await (await fetch(base + "/")).text();
   const anchors = ["draft-editor", "run-button", "group-select", "session-list", "session-limit", "k-input", "stop-after-hit", "timing-filter", "session-results", "summary", "apply-preview", "apply-run"];
@@ -288,12 +366,42 @@ try {
   assert.ok(bashSearch.durationMs < 5000, `full bash search must be under 5s, took ${bashSearch.durationMs}ms`);
   console.log(`search bash "${bashQuery}": ${bashSearch.sessions.length} sessions in ${bashSearch.durationMs}ms`);
   check("9 session search first-message and bash", { word, first: firstSearch.sessions.length, bash: bashSearch.sessions.length });
+
+  // F-2: a word that appears only in a subagent's first message finds the
+  // parent session, with the snippet marked as a subagent hit.
+  const fParentPath = sessionPath(fParent.id);
+  const fIndex = await sessionFiles();
+  const fChildren = fIndex.filter(file => file.parentPath === fParentPath);
+  assert.ok(fChildren.length >= 1, "F-2 needs the current session's subagent transcripts");
+  const parentTranscript = await readTranscript(fParentPath, "claude");
+  const parentText = parentTranscript.messages.map(m => m.Parts.map(p => p.Text ?? "").join("\n")).join("\n");
+  let fWord = "", fChildPath = "";
+  for (const child of fChildren) {
+    const t = await readTranscript(child.path, child.agent);
+    let first = "";
+    for (const m of t.messages) if (m.Role === "user") { const said = userSaid(m); if (said) { first = said; break; } }
+    const tokens = [
+      ...(first.match(/[A-Za-z][A-Za-z0-9_-]{7,}/g) ?? []),
+      ...(first.match(/[一-鿿]{6,}/g) ?? []),
+    ];
+    const word = tokens.find(token => !parentText.includes(token));
+    if (word) { fWord = word; fChildPath = child.path; break; }
+  }
+  assert.ok(fWord, "F-2 must find a word present only in a subagent message");
+  const fSearch = await json(`/api/sessions?q=${encodeURIComponent(fWord)}&scopes=user&limit=100`);
+  artifact.searchF = { word: fWord, child: fChildPath, sessions: fSearch.sessions.length };
+  const fFound = fSearch.sessions.find((session: any) => session.id === fParent.id);
+  assert.ok(fFound, `F-2 search for the subagent-only word must return the parent session`);
+  assert.ok(fFound.snippets.some((snippet: any) => !!snippet.subagent && snippet.text.toLowerCase().includes(fWord.toLowerCase())), "F-2 snippet must be marked as a subagent hit");
+  check("F-2 subagent-only search returns the parent, snippet marked 子 agent", {
+    word: fWord, child: fChildPath.split("/").slice(-1)[0], hits: fFound.hits,
+  });
   // E-3: timing classes, first hit and the histogram, all from the draft side.
   const timingIds = [...multi.map((session: any) => session.id), single.id];
-  const timingUse = group.rules.find((rule: any) => rule.use)?.use;
+  const timingUse = (group.rules.find((rule: any) => rule.intent) ?? group.rules.find((rule: any) => rule.use))?.use;
   const timingOther = group.members.find((member: string) => member !== timingUse);
-  assert.ok(timingUse && timingOther, "claude-opus must have two members for the timing switch");
-  const baseRun = await run({ group: group.id, draft, sessions: timingIds, k: 3, stopAfterHit: false });
+  assert.ok(timingUse && timingOther, "claude-opus must have at least two members for the timing switch");
+  const baseRun = await run({ group: group.id, draft, sessions: timingIds, k: 3, includeSubagents: false, stopAfterHit: false });
   // A rule whose message condition appears only in a later turn gives E-3 a
   // real mid-hit session, a later first hit and a switch cost, without
   // depending on a particular classifier answer. Choose a phrase unique to
@@ -324,10 +432,10 @@ try {
   const switchTo = group.members.find((member: string) => member !== previousMember) ?? timingOther;
   const timingDraft = structuredClone(draft);
   timingDraft.rules.push({ use: switchTo, where: [{ field: "message", op: "contains", value: phrase }] });
-  const timingRun = await run({ group: group.id, draft: timingDraft, sessions: timingIds, k: 3, stopAfterHit: false });
+  const timingRun = await run({ group: group.id, draft: timingDraft, sessions: timingIds, k: 3, includeSubagents: false, stopAfterHit: false });
   artifact.timing = { base: baseRun.result, midPhrase: phrase, midTurn: targetTurn, result: timingRun.result };
   assert.ok(timingRun.result.sessions.some((session: any) => session.class === "mid"), "E-3 must exercise a mid-hit session");
-  assert.ok(timingRun.result.summary.timing.midCost.switches > 0, "E-3 mid hit must carry a switch cost");
+  assert.ok(timingRun.result.summary.timing.main.midCost.switches > 0, "E-3 mid hit must carry a switch cost");
   assert.equal(timingRun.result.sessions.length, 4, "E-3 must return all four selected sessions");
   const byId = new Map(timingRun.result.sessions.map((session: any) => [session.id, session]));
   const histogram: Record<string, number> = { "1": 0, "2": 0, "3": 0, "4-5": 0, "6-10": 0, ">10": 0 };
@@ -340,7 +448,9 @@ try {
     const expectedClass = session.turns === 1 ? "single" : expectedFirst === null ? "miss" : expectedFirst <= 3 ? "early" : "mid";
     assert.equal(session.class, expectedClass, `session ${id} class`);
     classes[expectedClass]++;
-    if (expectedFirst !== null) {
+    // Single-turn sessions are counted on their own and stay out of the
+    // first-hit histogram, exactly as timingOf does.
+    if (expectedFirst !== null && expectedClass !== "single") {
       const bin = expectedFirst === 1 ? "1" : expectedFirst === 2 ? "2" : expectedFirst === 3 ? "3" : expectedFirst <= 5 ? "4-5" : expectedFirst <= 10 ? "6-10" : ">10";
       histogram[bin]++;
     }
@@ -353,13 +463,13 @@ try {
     }
   }
   assert.equal(classes.single, 1, "one single-turn session must be counted separately");
-  assert.equal(timingRun.result.summary.timing.single, classes.single);
-  assert.equal(timingRun.result.summary.timing.early, classes.early);
-  assert.equal(timingRun.result.summary.timing.mid, classes.mid);
-  assert.equal(timingRun.result.summary.timing.miss, classes.miss);
-  assert.equal(timingRun.result.summary.timing.multi, classes.early + classes.mid + classes.miss);
+  assert.equal(timingRun.result.summary.timing.main.single, classes.single);
+  assert.equal(timingRun.result.summary.timing.main.early, classes.early);
+  assert.equal(timingRun.result.summary.timing.main.mid, classes.mid);
+  assert.equal(timingRun.result.summary.timing.main.miss, classes.miss);
+  assert.equal(timingRun.result.summary.timing.main.multi, classes.early + classes.mid + classes.miss);
   for (const bin of Object.keys(histogram)) {
-    assert.equal(timingRun.result.summary.timing.histogram[bin], histogram[bin], `histogram bin ${bin}`);
+    assert.equal(timingRun.result.summary.timing.main.histogram[bin], histogram[bin], `histogram bin ${bin}`);
   }
   const midRows = timingRun.result.sessions
     .filter((session: any) => session.class === "mid")
@@ -368,30 +478,33 @@ try {
   const midMedian = midCosts.length
     ? Math.round(midCosts.length % 2 ? midCosts[(midCosts.length - 1) / 2] : (midCosts[midCosts.length / 2 - 1] + midCosts[midCosts.length / 2]) / 2)
     : 0;
-  assert.equal(timingRun.result.summary.timing.midCost.switches, midCosts.length);
-  assert.equal(timingRun.result.summary.timing.midCost.prefixTokens, midCosts.reduce((sum: number, value: number) => sum + value, 0));
-  assert.equal(timingRun.result.summary.timing.midCost.median, midMedian);
+  assert.equal(timingRun.result.summary.timing.main.midCost.switches, midCosts.length);
+  assert.equal(timingRun.result.summary.timing.main.midCost.prefixTokens, midCosts.reduce((sum: number, value: number) => sum + value, 0));
+  assert.equal(timingRun.result.summary.timing.main.midCost.median, midMedian);
   check("E-3 timing classes, firstHit, histogram and mid-hit cost", {
-    classes, histogram, midCost: timingRun.result.summary.timing.midCost,
+    classes, histogram, midCost: timingRun.result.summary.timing.main.midCost,
   });
 
   // E-4: stopAfterHit must skip the draft's later turns and strictly cut
   // actual Jev requests. Two fresh service processes give both runs an empty
   // cache, so the count is not hidden by the first run's answers.
-  // edited differs from current in the request bytes (so the draft is not
-  // served from the current side's answers) and hits early in these sessions.
-  const e4Draft = edited;
+  // Step 6 wrote the edited draft into the sandbox, so current and edited now
+  // ask identical Jev questions: the current side asks first and the draft
+  // side only ever hits. The original intent differs from the sandbox current
+  // in the request bytes (the draft asks its own answers) and still hits early
+  // in these sessions.
+  const e4Draft = draft;
   const labOff = await startLab(join(sandbox, "cache-off"));
   let e4Off: any;
   try {
-    e4Off = await labOff.run({ group: group.id, draft: e4Draft, sessions: timingIds, k: 3, stopAfterHit: false });
+    e4Off = await labOff.run({ group: group.id, draft: e4Draft, sessions: timingIds, k: 3, includeSubagents: false, stopAfterHit: false });
   } finally {
     await labOff.stop();
   }
   const labOn = await startLab(join(sandbox, "cache-on"));
   let e4On: any;
   try {
-    e4On = await labOn.run({ group: group.id, draft: e4Draft, sessions: timingIds, k: 3, stopAfterHit: true });
+    e4On = await labOn.run({ group: group.id, draft: e4Draft, sessions: timingIds, k: 3, includeSubagents: false, stopAfterHit: true });
   } finally {
     await labOn.stop();
   }
@@ -416,6 +529,92 @@ try {
   console.log(`E-4 offDraftRequests=${offRequests} onDraftRequests=${onRequests} classes=${e4On.result.sessions.map((session: any) => `${session.class}/${session.firstHit}`).join(",")}`);
   check("E-4 stopAfterHit cuts draft Jev requests; class/firstHit identical", {
     offDraftRequests: offRequests, onDraftRequests: onRequests,
+  });
+
+  // F-3: the parent and every subagent replay as their own conversation.
+  const f3Run = await run({ group: group.id, draft: edited, sessions: [fParent.id], k: 3, stopAfterHit: true });
+  artifact.subagents = {
+    parent: fParent.id,
+    expected: fChildren.length,
+    sessions: f3Run.result.sessions.map((session: any) => ({
+      id: session.id, parentId: session.parentId ?? null, subagentId: session.subagentId ?? null,
+      turns: session.turns, rows: session.rows.length, class: session.class,
+      initial: session.rows[0]?.initialMember ?? "",
+    })),
+    summary: f3Run.result.summary.timing,
+  };
+  const f3Sessions = f3Run.result.sessions;
+  const f3Main = f3Sessions.filter((session: any) => !session.parentId);
+  const f3Subs = f3Sessions.filter((session: any) => session.parentId === fParent.id);
+  assert.equal(f3Main.length, 1, "F-3 must return one main session");
+  assert.equal(f3Subs.length, fChildren.length, "F-3 must return one result per subagent");
+  for (const result of [f3Main[0], ...f3Subs]) {
+    assert.ok(result.turns >= 1, `F-3 ${result.id} must have turns`);
+    assert.equal(result.rows.length, result.turns, `F-3 ${result.id} rows must equal its own turns`);
+    for (let i = 0; i < result.rows.length; i++) {
+      assert.equal(result.rows[i].turn, i + 1, `F-3 ${result.id} turns must be 1..n`);
+      assert.equal(result.rows[i].session, sessionPath(result.id), `F-3 ${result.id} rows must belong to its own transcript`);
+    }
+  }
+  const parentInitial = f3Main[0].rows[0].initialMember;
+  for (const sub of f3Subs) {
+    const own = await readHistory({ sessions: [sessionPath(sub.id)], all: true });
+    const expected = own.samples[0]?.initialMembers[group.id] ?? "";
+    assert.equal(sub.rows[0].initialMember, expected, `F-3 subagent ${sub.subagentId} initial member must come from its own routing record`);
+  }
+  if (parentInitial) {
+    assert.ok(f3Subs.some((sub: any) => !sub.rows[0].initialMember), "F-3 a subagent with no own routing row must be unknown, not inherit the parent");
+  }
+  const timingFor = (list: any[]) => {
+    const counts: Record<string, number> = { single: 0, early: 0, mid: 0, miss: 0 };
+    const histogram: Record<string, number> = { "1": 0, "2": 0, "3": 0, "4-5": 0, "6-10": 0, ">10": 0 };
+    const costs: number[] = [];
+    let prefixTokens = 0;
+    for (const session of list) {
+      const first = session.rows.find((row: any) => !row.draft.stopped && row.draft.rule > 0)?.turn ?? null;
+      const cls = session.turns === 1 ? "single" : first === null ? "miss" : first <= 3 ? "early" : "mid";
+      assert.equal(session.class, cls, `F-3 ${session.id} class`);
+      counts[cls]++;
+      if (first !== null && cls !== "single") {
+        const bin = first === 1 ? "1" : first === 2 ? "2" : first === 3 ? "3" : first <= 5 ? "4-5" : first <= 10 ? "6-10" : ">10";
+        histogram[bin]++;
+      }
+      if (cls !== "mid") continue;
+      for (const row of session.rows) {
+        if (!row.draft.switched) continue;
+        costs.push(row.draft.prefixTokens);
+        prefixTokens += row.draft.prefixTokens;
+      }
+    }
+    costs.sort((a, b) => a - b);
+    const median = costs.length
+      ? Math.round(costs.length % 2 ? costs[(costs.length - 1) / 2] : (costs[costs.length / 2 - 1] + costs[costs.length / 2]) / 2)
+      : 0;
+    return {
+      ...counts, multi: counts.early + counts.mid + counts.miss, histogram,
+      midCost: { switches: costs.length, prefixTokens, median },
+    };
+  };
+  const expectedMain = timingFor(f3Main);
+  const expectedSubs = timingFor(f3Subs);
+  for (const side of ["main", "subagents"] as const) {
+    const expected = side === "main" ? expectedMain : expectedSubs;
+    const got = f3Run.result.summary.timing[side];
+    for (const key of ["single", "early", "mid", "miss", "multi"]) assert.equal(got[key], (expected as any)[key], `F-3 ${side} ${key}`);
+    for (const bin of Object.keys(expected.histogram)) assert.equal(got.histogram[bin], expected.histogram[bin], `F-3 ${side} histogram ${bin}`);
+    assert.equal(got.midCost.switches, expected.midCost.switches, `F-3 ${side} midCost switches`);
+    assert.equal(got.midCost.prefixTokens, expected.midCost.prefixTokens, `F-3 ${side} midCost tokens`);
+    assert.equal(got.midCost.median, expected.midCost.median, `F-3 ${side} midCost median`);
+  }
+  const f3Only = await run({ group: group.id, draft: edited, sessions: [fParent.id], k: 3, includeSubagents: false, stopAfterHit: true });
+  artifact.subagents.mainOnly = f3Only.result.sessions.map((session: any) => ({ id: session.id, parentId: session.parentId ?? null, turns: session.turns }));
+  assert.equal(f3Only.result.sessions.length, 1, "F-3 includeSubagents=false must return only the main session");
+  assert.ok(!f3Only.result.sessions[0].parentId, "F-3 main-only result must not be a subagent");
+  assert.equal(f3Only.result.sessions[0].turns, f3Main[0].turns, "F-3 main-only result must have the main session's turns");
+  console.log(`F-3 parentTurns=${f3Main[0].turns} subagents=${f3Subs.length} main=${JSON.stringify(expectedMain)} subs=${JSON.stringify(expectedSubs)} initial=${JSON.stringify([{ parent: parentInitial }, ...f3Subs.map((sub: any) => ({ id: sub.subagentId, initial: sub.rows[0].initialMember }))])}`);
+  check("F-3 subagents replay independently; split summary sums each part; toggle works", {
+    parentTurns: f3Main[0].turns, subagents: f3Subs.length,
+    main: expectedMain, subagentsTiming: expectedSubs,
   });
   // 12: rerun the turnIn probe over every sample the plugin produces. A
   // sample must be the message that opened a new turn (turnIn within false);
@@ -447,18 +646,27 @@ try {
   // session must stay on the previous actual member (stickyWhy kept), and
   // only a change of actual member counts as a switch.
   assert.equal(group.affinity, "session", "this check is written for the real claude-opus affinity");
-  // Pick a real multi-turn session and change the rule's use to the group's
-  // other member. The same turns then hit on both sides, while the session
-  // moves member in current (wokey) but not in draft (jmds).
+  // Pick a real multi-turn session and aim the original intent rule at a
+  // member other than that session's first actual member. Step 6 wrote the
+  // edited intent into the sandbox current group; the draft keeps the
+  // original intent (the one that classifies a reseller chat) and only
+  // changes `use`, so its first rule hit must move the session to the other
+  // member, while later non-hit turns stay there by affinity.
   const switchSearch = await json(`/api/sessions?q=${encodeURIComponent("llm reseller")}&scopes=first&limit=20`);
-  const switchSession = switchSearch.sessions.find((session: any) => session.first.includes("我想做llm reseller") && session.turns > 1);
-  assert.ok(switchSession, "a multi-turn session for the stickiness check must exist");
-  const currentUse = group.rules.find((rule: any) => rule.use)?.use;
-  const otherMember = group.members.find((member: string) => member !== currentUse);
-  assert.ok(currentUse && otherMember, "claude-opus must have two members to switch between");
+  const switchCandidates = switchSearch.sessions.filter((session: any) => session.first.includes("我想做llm reseller") && session.turns > 1);
+  assert.ok(switchCandidates.length, "a multi-turn session for the stickiness check must exist");
+  let switchSession: any = null, switchInitial = "";
+  for (const candidate of switchCandidates) {
+    const own = await readHistory({ sessions: [sessionPath(candidate.id)], all: true });
+    const initial = own.samples[0]?.initialMembers[group.id] ?? "";
+    if (initial) { switchSession = candidate; switchInitial = initial; break; }
+  }
+  assert.ok(switchSession, "the stickiness session must have a known first actual member");
+  const switchUse = group.members.find((member: string) => member !== switchInitial);
+  assert.ok(switchUse, "claude-opus must have a member other than the session's initial one");
   const stickyDraft = structuredClone(draft);
-  for (const rule of stickyDraft.rules) rule.use = otherMember;
-  const stickyRun = await run({ group: group.id, draft: stickyDraft, sessions: [switchSession.id], k: 3, stopAfterHit: false });
+  for (const rule of stickyDraft.rules) if (rule.intent) rule.use = switchUse;
+  const stickyRun = await run({ group: group.id, draft: stickyDraft, sessions: [switchSession.id], k: 3, includeSubagents: false, stopAfterHit: false });
   const stickyRows = stickyRun.result.sessions.flatMap((session: any) => session.rows);
   const bySession = new Map<string, any[]>();
   for (const row of stickyRows) {
@@ -512,6 +720,32 @@ try {
   check("13 session stickiness: kept after hit, switches only on member change, summary sums", {
     rows: stickyRows.length, hitRows, keptAfterHit, switchedRows, sideCounts,
   });
+
+  // F-4: what agent does magpie's routing log show for the plugin's own Jev
+  // calls? Printed, not asserted.
+  const routingDir = join(homedir(), ".config/magpie/routing");
+  const startedAt = Date.parse(artifact.started);
+  const jevAgents: Record<string, number> = {};
+  let jevRows = 0;
+  try {
+    for (const name of (await readdir(routingDir)).filter(name => name.endsWith(".jsonl"))) {
+      const text = await readFile(join(routingDir, name), "utf8");
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        let row: any;
+        try { row = JSON.parse(line); } catch { continue; }
+        if (Date.parse(row?.time) < startedAt) continue;
+        const isJev = row?.model === "typesafe/jev-latest" || (row?.usage ?? []).some((u: any) => String(u?.model ?? "").includes("jev"));
+        if (!isJev) continue;
+        const agent = String(row.agent ?? "(none)");
+        jevAgents[agent] = (jevAgents[agent] ?? 0) + 1;
+        jevRows++;
+      }
+    }
+  } catch { /* the log is evidence, not a gate */ }
+  artifact.jevAgent = { rows: jevRows, agents: jevAgents };
+  console.log(`F-4 plugin Jev requests during e2e (${jevRows}): ${Object.keys(jevAgents).length ? Object.entries(jevAgents).map(([agent, count]) => `${agent}=${count}`).join(", ") : "(none found)"}`);
+  check("F-4 plugin Jev requests logged as agent", { rows: jevRows, agents: jevAgents });
   artifact.status = "PASS";
 } catch (error: any) {
   artifact.status = "FAIL";

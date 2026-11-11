@@ -49,7 +49,8 @@ export interface SideResult {
 }
 export interface UnknownCond { side: "current" | "draft"; rule: number; condition: string }
 export interface Row {
-  id: string; agent: string; session: string; sessionId: string; folder: string; time: string;
+  id: string; agent: string; session: string; sessionId: string; parent: string; parentId: string; subagentId?: string;
+  folder: string; time: string;
   turn: number;
   text: string; fullText: string;
   prev: { user: string; reply: string };
@@ -64,6 +65,7 @@ export interface StickyCounts {
 export type SessionClass = "single" | "early" | "mid" | "miss";
 export interface SessionResult {
   id: string; agent: string; folder: string; turns: number;
+  parentId?: string; subagentId?: string;
   first: string;
   class: SessionClass; firstHit: number | null;
   switched: boolean; from: string; to: string; prefixTokens: number;
@@ -79,12 +81,17 @@ export interface TimingCounts {
   histogram: TimingHistogram;
   midCost: { switches: number; prefixTokens: number; median: number; estimatedTokens: number };
 }
+export interface TimingSummary {
+  k: number; stopAfterHit: boolean;
+  main: TimingCounts;
+  subagents: TimingCounts;
+}
 export interface JevCounts { requests: number; hits: number }
 export interface Summary {
   current: Record<string, number>; draft: Record<string, number>;
   transitions: Record<string, Record<string, number>>; changed: number;
   sticky: { current: StickyCounts; draft: StickyCounts; diff: StickyCounts };
-  timing: TimingCounts;
+  timing: TimingSummary;
   jev: { current: JevCounts; draft: JevCounts };
 }
 export interface RunResult { sessions: SessionResult[]; summary: Summary }
@@ -334,6 +341,8 @@ function groupedSessions(rows: Row[], k: number): SessionResult[] {
       agent: list[0].agent,
       folder: list[0].folder,
       turns: list.length,
+      ...(list[0].parent ? { parentId: sessionId(list[0].parent) } : {}),
+      ...(list[0].subagentId ? { subagentId: list[0].subagentId } : {}),
       first: list[0].fullText || list[0].text,
       class: cls,
       firstHit,
@@ -423,7 +432,7 @@ export async function replay(
   const summary: Summary = {
     current: {}, draft: {}, transitions: {}, changed: 0,
     sticky: { current: zeroSticky(), draft: zeroSticky(), diff: zeroSticky() },
-    timing: timingOf([], k, stopAfterHit),
+    timing: { k, stopAfterHit, main: timingOf([], k, stopAfterHit), subagents: timingOf([], k, stopAfterHit) },
     jev: { current: zeroCounts(), draft: zeroCounts() },
   };
   let done = 0;
@@ -458,6 +467,8 @@ export async function replay(
         ];
         const row: Row = {
           id: sample.id, agent: sample.agent, session: sample.session, sessionId: sessionId(sample.session),
+          parent: sample.parent ?? "", parentId: sample.parent ? sessionId(sample.parent) : "",
+          ...(sample.subagentId ? { subagentId: sample.subagentId } : {}),
           folder: sample.folder, time: sample.time,
           turn,
           text: sample.text, fullText: sample.fullText, prev: sample.prev,
@@ -494,7 +505,13 @@ export async function replay(
   });
   summary.sticky.diff = diff(summary.sticky.current, summary.sticky.draft);
   const grouped = groupedSessions(rows, k);
-  summary.timing = timingOf(grouped, k, stopAfterHit);
+  const main = grouped.filter(session => !session.parentId);
+  const children = grouped.filter(session => !!session.parentId);
+  summary.timing = {
+    k, stopAfterHit,
+    main: timingOf(main, k, stopAfterHit),
+    subagents: timingOf(children, k, stopAfterHit),
+  };
   summary.jev.current = sumJev(rows, "current");
   summary.jev.draft = sumJev(rows, "draft");
   return { sessions: grouped, summary };

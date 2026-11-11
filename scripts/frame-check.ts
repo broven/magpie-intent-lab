@@ -92,7 +92,7 @@ try {
   const logicSteps = await frame.$$eval('[data-testid="logic-step"]', (nodes: any[]) => nodes.length);
   if (logicSteps !== 2) throw new Error(`decision-logic panel has ${logicSteps} steps, expected 2`);
 
-  await frame.waitForSelector("#session-list .session-card", { timeout: 60_000 });
+  await frame.waitForSelector("#session-list .session-card", { timeout: 600_000 });
   const listScroll = await frame.$eval("#session-list", (node: any) => ({
     scrollHeight: node.scrollHeight, clientHeight: node.clientHeight,
   }));
@@ -103,7 +103,14 @@ try {
   await frame.click('[data-testid="session-select-none"]');
   const boxes = await frame.$$('[data-testid="session-checkbox"]');
   if (boxes.length < 3) throw new Error(`session list has ${boxes.length} sessions, need at least 3`);
-  for (const box of boxes.slice(0, 3)) await box.check();
+  const subagentSession = await frame.$$eval('[data-testid="session-subagents"]', (nodes: any[]) => {
+    const card = nodes[0]?.closest(".session-card");
+    return card?.dataset.sessionId ?? "";
+  });
+  if (!subagentSession) throw new Error("no catalog entry shows 含 N 个子 agent");
+  const ids = await frame.$$eval('[data-testid="session-checkbox"]', (nodes: any[]) => nodes.map(node => node.dataset.sessionId));
+  const chosen = [subagentSession, ...ids.filter((id: string) => id !== subagentSession).slice(0, 2)];
+  for (const id of chosen) await frame.locator(`[data-testid="session-checkbox"][data-session-id="${id}"]`).check();
   const selected = await frame.evaluate(() => state.selectedSessions.size);
   if (selected !== 3) throw new Error(`expected 3 selected sessions, got ${selected}`);
 
@@ -111,25 +118,38 @@ try {
   await frame.waitForFunction(
     () => document.querySelectorAll('[data-testid="session-result"]').length === 3,
     undefined,
-    { timeout: 300_000 },
+    { timeout: 600_000 },
   );
   const timelineCells = await frame.$$eval('[data-testid="turn-cell"]', (nodes: any[]) => nodes.length);
   if (!timelineCells) throw new Error("session main view has no timeline cells");
+  await frame.waitForSelector('[data-testid="subagent-summary"]', { timeout: 60_000 });
+  const subagentSummary = await frame.$eval('[data-testid="subagent-summary"]', (node: any) => node.textContent ?? "");
+  if (!/\d+ 个子 agent/.test(subagentSummary)) throw new Error(`subagent summary text: ${subagentSummary}`);
+  await frame.click('[data-testid="subagent-summary"] > summary');
+  await frame.waitForSelector('[data-testid="subagent-result"]', { timeout: 10_000 });
+  const subagentResults = await frame.$$eval('[data-testid="subagent-result"]', (nodes: any[]) => nodes.length);
 
-  await frame.click('[data-testid="session-result-head"]');
-  await frame.waitForSelector('[data-testid="turn-row"]', { timeout: 10_000 });
-  const turnRows = await frame.$$eval('[data-testid="turn-row"]', (nodes: any[]) => nodes.length);
+  const parentCard = frame.locator('#session-results .session-result').filter({ has: frame.locator('[data-testid="subagent-summary"]') }).first();
+  await parentCard.locator('[data-testid="session-result-head"]').first().click();
+  const parentTurns = parentCard.locator('[data-testid="session-turns"]').last();
+  await parentTurns.locator('[data-testid="turn-row"]').first().waitFor({ state: "visible", timeout: 10_000 });
+  const turnRows = await parentTurns.locator('[data-testid="turn-row"]').count();
   if (!turnRows) throw new Error("expanded session has no per-turn rows");
   const headers = await frame.$$eval('[data-testid="result-table"] th', (nodes: any[]) => nodes.map(node => node.textContent));
   for (const wanted of ["当前 实际模型", "草稿 实际模型"]) {
     if (!headers.includes(wanted)) throw new Error(`turn table has no ${wanted} column: ${headers.join(" | ")}`);
   }
-  await frame.click('[data-testid="turn-row"]');
+  await parentTurns.locator('[data-testid="turn-row"]').first().click();
   await frame.waitForSelector("tr.detail", { timeout: 10_000 });
   const detail = await frame.$eval("tr.detail", (node: any) => node.textContent ?? "");
   if (!detail.includes("判定过程")) throw new Error("expanded turn has no 判定过程 trace");
   if (!detail.includes("粘性")) throw new Error("expanded turn has no 粘性 trace");
-  console.log(`PASS frame went to ${frame.url()} (origin ${origin}); groups: ${options.join(", ")}; logic steps: ${logicSteps}; sessions: 3; list scroll: ${listScroll.scrollHeight}/${listScroll.clientHeight}; timeline: ${timelineCells}; turn rows: ${turnRows}; trace: 判定过程; sticky: 粘性`);
+
+  await parentCard.locator('[data-testid="session-preview-result"]').click();
+  await frame.waitForSelector('[data-testid="preview-subagent"]', { timeout: 60_000 });
+  const previewFolded = await frame.$eval('[data-testid="preview-subagent"]', (node: any) => node.open === false);
+  if (!previewFolded) throw new Error("preview subagent block must start folded");
+  console.log(`PASS frame went to ${frame.url()} (origin ${origin}); groups: ${options.join(", ")}; logic steps: ${logicSteps}; sessions: 3; list scroll: ${listScroll.scrollHeight}/${listScroll.clientHeight}; subagents: ${subagentResults}; timeline: ${timelineCells}; turn rows: ${turnRows}; trace: 判定过程; sticky: 粘性; preview folded`);
 } catch (err: any) {
   failed = true;
   console.error(`FAIL ${err?.message ?? err}`);

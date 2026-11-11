@@ -9,6 +9,11 @@ export interface TimedMessage extends Message {
 export interface Transcript {
   agent: Agent; path: string; session: string; aliases: string[]; cwd: string;
   start: number; end: number; messages: TimedMessage[]; malformed: number;
+  // A subagent transcript is its own conversation, but belongs to a parent
+  // session's directory entry.
+  subagentId?: string;
+  parentPath?: string;
+  parentKey?: string;
 }
 export async function filesUnder(dir: string, suffixes: string[] = [".jsonl"]): Promise<string[]> {
   let entries;

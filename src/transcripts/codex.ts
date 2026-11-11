@@ -10,7 +10,15 @@ export async function readCodex(file: string) {
     const p = row.payload;
     if (!p || typeof p !== "object") continue;
     if (row.type === "session_meta") {
-      t.session = String(p.session_id ?? p.id ?? t.aliases[0] ?? "");
+      // A subagent's meta names the parent in session_id/parent_thread_id and
+      // itself in id; its routing rows use the subagent id as their session.
+      // Older rollouts also carry source.subagent.thread_spawn.parent_thread_id.
+      const own = String(p.id ?? p.session_id ?? t.aliases[0] ?? "");
+      t.session = own;
+      const spawn = typeof p.source === "object" && p.source ? p.source.subagent : undefined;
+      const spawnedParent = typeof spawn === "object" && spawn ? spawn.thread_spawn?.parent_thread_id : undefined;
+      const parent = [p.parent_thread_id, spawnedParent].find(v => typeof v === "string" && v && v !== own);
+      if (typeof parent === "string") t.parentKey = parent;
       t.aliases.push(...[p.id, p.session_id].filter(v => typeof v === "string"));
       if (typeof p.cwd === "string") t.cwd = p.cwd;
       t.start = Date.parse(timestamp(p.timestamp ?? row.timestamp)) || 0;
@@ -49,5 +57,6 @@ export async function readCodex(file: string) {
       });
     }
   }
+  if (!t.session) t.session = t.aliases[0] ?? "";
   return finish(t);
 }
