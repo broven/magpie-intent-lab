@@ -6,6 +6,21 @@
   const status = document.getElementById("status");
   let port = DEFAULT_PORT;
   let service = "";
+  // Armed before anything is awaited: WebKit says nothing when the target
+  // can't be reached, and a bridge that never answers would hang here too.
+  // Still on this document after 5s means the jump didn't happen.
+  setTimeout(() => {
+    const where = service || `127.0.0.1:${port}`;
+    status.textContent = `本地服务没有响应（${where}），请确认插件已开启。`;
+    if (document.getElementById("retry")) return;
+    const btn = document.createElement("button");
+    btn.id = "retry";
+    btn.type = "button";
+    btn.textContent = "重试";
+    btn.style.cssText = "margin-top:10px;padding:2px 12px;font:inherit;cursor:pointer;";
+    btn.addEventListener("click", () => location.reload());
+    status.after(btn);
+  }, 5000);
   try {
     await window.magpie?.ready;
     const s = window.magpie?.service;
@@ -16,19 +31,6 @@
     if (o && Number(o.port) > 0) port = Number(o.port);
   } catch { /* no options: default port */ }
 
-  // WebKit says nothing when the target can't be reached: the frame stays
-  // on this document. Still here after 5s means the jump didn't happen.
-  setTimeout(() => {
-    status.textContent = `本地服务没有响应（127.0.0.1:${port}），请确认插件已开启。`;
-    if (document.getElementById("retry")) return;
-    const btn = document.createElement("button");
-    btn.id = "retry";
-    btn.type = "button";
-    btn.textContent = "重试";
-    btn.style.cssText = "margin-top:10px;padding:2px 12px;font:inherit;cursor:pointer;";
-    btn.addEventListener("click", () => location.reload());
-    status.after(btn);
-  }, 5000);
 
   location.replace(service || `http://127.0.0.1:${port}/`);
 })();

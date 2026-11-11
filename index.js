@@ -13,12 +13,18 @@ export const IntentLab = async (_input, options = {}) => {
     : Number.isInteger(fromEnv) && fromEnv > 0 ? fromEnv : 3488;
   const old = globalThis[running];
   if (old && old.port === port) return {};
-  const service = await startService({
+  // Not awaited: while the host restarts, the old one holds the port for a
+  // while, and magpie gives a plugin's load 20s. The service retries in the
+  // background and the load returns at once.
+  globalThis[running] = { port };
+  startService({
     port,
     magpieBin: typeof options?.magpieBin === "string" ? options.magpieBin : undefined,
     retry: true,
     log: false,
+  }).catch(err => {
+    console.error(`[intent-lab] service did not start: ${err?.message ?? err}`);
+    if (globalThis[running]?.port === port) delete globalThis[running];
   });
-  globalThis[running] = service;
   return {};
 };
