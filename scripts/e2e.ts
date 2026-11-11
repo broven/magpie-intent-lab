@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,9 +12,23 @@ const artifactPath = join(artifactDir, `e2e-${new Date().toISOString().replaceAl
 const configFile = join(homedir(), ".config/magpie/providers.json");
 const digest = async () => createHash("sha256").update(await readFile(configFile)).digest("hex");
 const configBefore = await digest();
-const artifact: any = { started: new Date().toISOString(), checks: [], configBefore };
+
+// The real apply runs the real magpie CLI. XDG_CONFIG_HOME moves its
+// providers.json into this sandbox; HOME keeps its agent-file migrations
+// and catalog sync away from the user's ~/.claude, ~/.codex and so on.
+const sandbox = await mkdtemp(join(tmpdir(), "intent-lab-apply-"));
+const sandboxHome = join(sandbox, "home");
+await mkdir(join(sandbox, "magpie"), { recursive: true, mode: 0o700 });
+await mkdir(sandboxHome, { recursive: true, mode: 0o700 });
+await copyFile(configFile, join(sandbox, "magpie/providers.json"));
+const cliEnv = { XDG_CONFIG_HOME: sandbox, HOME: sandboxHome };
+
+const artifact: any = { started: new Date().toISOString(), checks: [], configBefore, sandbox: { xdg: sandbox, home: sandboxHome } };
 const child = Bun.spawn([process.execPath, join(root, "src/server.ts")], {
-  cwd: root, env: { ...process.env, INTENT_LAB_PORT: "0" }, stdout: "pipe", stderr: "inherit",
+  cwd: root,
+  env: { ...process.env, INTENT_LAB_PORT: "0", INTENT_LAB_MAGPIE_ENV: JSON.stringify(cliEnv) },
+  stdout: "pipe",
+  stderr: "inherit",
 });
 let base = "";
 const stdout = (async () => {
@@ -115,12 +129,31 @@ try {
   assert.ok(Array.isArray(commands.commands) && commands.commands.length > 0);
   assert.ok(commands.commands.some((c: string) => /group rule rm/.test(c)));
   assert.ok(commands.commands.some((c: string) => /group rule add/.test(c) && c.includes("写代码或改代码") && c.includes("at=")));
-  // The release boundary is observable: even a valid edit must never execute.
-  const disabled = await fetch(base + "/api/apply", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ group: group.id, draft: edited, dryRun: false }) });
-  assert.equal(disabled.status, 501);
+  check("5 apply dryRun commands", { commands: commands.commands.length });
+  const real = await json("/api/apply", { group: group.id, draft: edited, dryRun: false });
+  artifact.applyReal = {
+    ok: real.ok,
+    commands: real.commands,
+    executed: real.executed,
+    rejected: real.rejected,
+    readBack: real.readBack,
+    error: real.error,
+  };
+  assert.equal(real.ok, true, real.error);
+  assert.ok(Array.isArray(real.executed) && real.executed.length > 0, "real apply must execute commands");
+  assert.match(real.readBack ?? "", /写代码或改代码/, "readback must contain the new intent");
+  const sandboxConfig = await readFile(join(sandbox, "magpie/providers.json"), "utf8");
+  assert.match(sandboxConfig, /写代码或改代码/, "the sandbox providers.json must have changed");
   artifact.configAfter = await digest();
   assert.equal(artifact.configAfter, configBefore, "real configuration must remain byte-for-byte unchanged");
-  check("5 apply dryRun commands; real apply=501; config unchanged", { commands: commands.commands.length });
+  check("6 sandboxed real apply; readback has new intent; real config unchanged", {
+    executed: real.executed.length,
+    readBack: real.readBack.split("\n").filter(Boolean).slice(0, 3),
+  });
+  const html = await (await fetch(base + "/")).text();
+  const anchors = ["draft-editor", "run-button", "result-table", "group-select", "limit-input", "summary", "apply-preview", "apply-run"];
+  for (const anchor of anchors) assert.ok(html.includes(`data-testid="${anchor}"`), `UI must contain data-testid=${anchor}`);
+  check("7 UI anchors", { anchors });
   artifact.status = "PASS";
 } catch (error: any) {
   artifact.status = "FAIL";
@@ -133,5 +166,6 @@ try {
   await stdout;
   artifact.finished = new Date().toISOString();
   await writeFile(artifactPath, JSON.stringify(artifact, null, 2), { mode: 0o600 });
+  if (artifact.status === "PASS") await rm(sandbox, { recursive: true, force: true });
   console.log(`artifacts: ${artifactPath}`);
 }

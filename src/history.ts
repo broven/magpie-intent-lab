@@ -102,7 +102,7 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
   const routes = routing.routes.filter(r => selected.agents.has(r.agent) && Date.parse(r.time) >= selected.from && Date.parse(r.time) <= selected.to);
   const files = await Promise.all([
     selected.agents.has("claude") ? filesUnder(join(home, ".claude/projects")) : [],
-    selected.agents.has("codex") ? filesUnder(join(home, ".codex/sessions")) : [],
+    selected.agents.has("codex") ? filesUnder(join(home, ".codex/sessions"), [".jsonl", ".jsonl.zst"]) : [],
     selected.agents.has("pi") ? filesUnder(join(home, ".pi/agent/sessions")) : [],
   ]);
   const claudeFiles = new Map<string, string[]>();
@@ -112,7 +112,13 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
   }
   const codexFiles = new Map<string, string[]>();
   for (const file of files[1]) for (const key of basename(file).match(/[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}/gi) ?? []) {
-    codexFiles.set(key, [...(codexFiles.get(key) ?? []), file]);
+    const list = codexFiles.get(key) ?? [];
+    // A plain rollout and its compressed copy are one transcript. Keep the
+    // plain one, and leave two same-format files to the ambiguity check.
+    if (file.endsWith(".zst") && list.some(f => !f.endsWith(".zst"))) continue;
+    if (!file.endsWith(".zst")) list.splice(0, list.length, ...list.filter(f => !f.endsWith(".zst")));
+    list.push(file);
+    codexFiles.set(key, list);
   }
   const pi = await mapLimit(files[2], 6, f => transcript(f, "pi"));
   const linked = new Map<string, { t: Transcript; routes: Route[] }>();

@@ -7,7 +7,7 @@ export interface SideResult {
 }
 export interface UnknownCond { side: "current" | "draft"; rule: number; condition: string }
 export interface Row {
-  id: string; agent: string; folder: string; time: string; text: string;
+  id: string; agent: string; folder: string; time: string; text: string; fullText: string;
   prev: { user: string; reply: string };
   current: SideResult; draft: SideResult;
   changed: boolean; unknownConds: UnknownCond[];
@@ -100,7 +100,7 @@ export async function replay(jev: JevClient, group: Group, current: Group, draft
         ];
         const row: Row = {
           id: sample.id, agent: sample.agent, folder: sample.folder, time: sample.time,
-          text: sample.text, prev: sample.prev,
+          text: sample.text, fullText: sample.fullText, prev: sample.prev,
           current: a.result, draft: b.result,
           changed: a.result.intent !== b.result.intent || a.result.use !== b.result.use || a.result.rule !== b.result.rule,
           unknownConds: unknown,

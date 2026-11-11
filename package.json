@@ -8,7 +8,8 @@
   "scripts": {
     "start": "bun src/server.ts",
     "parity": "bash scripts/parity.sh",
-    "e2e": "bun scripts/e2e.ts"
+    "e2e": "bun scripts/e2e.ts",
+    "ui-shot": "bun scripts/ui-shot.ts"
   },
   "dependencies": {
     "re2js": "2.10.0"

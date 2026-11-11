@@ -35,8 +35,8 @@ function folderWord(folder: string): string | null {
 // CLI would normalize or refuse makes the rule unsafe to write back.
 export function renderRule(rule: Rule, group: Group): { words?: string[]; reason?: string } {
   if (!rule || typeof rule !== "object" || Array.isArray(rule)) return { reason: "规则不是对象" };
-  if (rule.pause) return { reason: "阶段 A 不写回 pause 规则" };
-  if (rule.where?.length) return { reason: "where 条件无法在阶段 A 无损还原成 CLI 参数" };
+  if (rule.pause) return { reason: "不写回 pause 规则" };
+  if (rule.where?.length) return { reason: "where 条件无法无损还原成 CLI 参数" };
   for (const key of Object.keys(rule)) if (!ruleFields.has(key)) return { reason: `未知字段 ${key} 无法还原成 CLI 参数` };
   const uses = [rule.use, ...(rule.more ?? [])].filter((v): v is string => typeof v === "string" && v !== "");
   if (!uses.length) return { reason: "规则没有 use" };
@@ -104,13 +104,20 @@ export function planApply(group: Group, draft: Group, bin: string): ApplyPlan {
   const currentSure = group.intentSure ?? null;
   const draftSure = draft.intentSure ?? null;
   if (currentSure !== draftSure) {
-    return { commands: [], rejected: [], error: "阶段 A 的写回只改 intent、use 和增删规则，不改 intentSure" };
+    return { commands: [], rejected: [], error: "写回只改 intent、use 和增删规则，不改 intentSure" };
   }
-  const add = (rule: Rule, index: number, at: number) => {
+  // magpie drops a group's classifier when its last intent rule is removed,
+  // so an add that puts an intent rule back must name the classifier the
+  // group already had. The writeback never changes that classifier.
+  const buildAdd = (rule: Rule, at: number): { command?: string; reason?: string } => {
     const rendered = renderRule(rule, group);
-    if (rendered.reason) { rejected.push({ rule: index + 1, reason: rendered.reason }); return false; }
-    commands.push([bin, "group", "rule", "add", quote(group.id), ...rendered.words!.map(quote), "at=" + at].join(" "));
-    return true;
+    if (rendered.reason) return { reason: rendered.reason };
+    const words = [...rendered.words!];
+    if (rule.intent) {
+      if (!group.classifier) return { reason: "组没有 classifier，无法写回 intent 规则" };
+      words.push("classifier=" + group.classifier);
+    }
+    return { command: [bin, "group", "rule", "add", quote(group.id), ...words.map(quote), "at=" + at].join(" ") };
   };
   if (currentRules.length === draftRules.length) {
     // Same length: touch only the rules that changed, last first so the
@@ -119,13 +126,13 @@ export function planApply(group: Group, draft: Group, bin: string): ApplyPlan {
       const a = currentRules[i], b = draftRules[i];
       if (stable(a) === stable(b)) continue;
       if (stable(withoutIntentUse(a)) !== stable(withoutIntentUse(b))) {
-        rejected.push({ rule: i + 1, reason: "阶段 A 只能改 intent 和 use；这条规则还有其它字段变化" });
+        rejected.push({ rule: i + 1, reason: "只能改 intent 和 use；这条规则还有其它字段变化" });
         continue;
       }
-      const rendered = renderRule(b, group);
-      if (rendered.reason) { rejected.push({ rule: i + 1, reason: rendered.reason }); continue; }
+      const built = buildAdd(b, i + 1);
+      if (built.reason) { rejected.push({ rule: i + 1, reason: built.reason }); continue; }
       commands.push([bin, "group", "rule", "rm", quote(group.id), String(i + 1)].join(" "));
-      commands.push([bin, "group", "rule", "add", quote(group.id), ...rendered.words!.map(quote), "at=" + (i + 1)].join(" "));
+      commands.push(built.command!);
     }
     return { commands, rejected };
   }
@@ -140,14 +147,14 @@ export function planApply(group: Group, draft: Group, bin: string): ApplyPlan {
   ) suffix++;
   const removeCount = currentRules.length - prefix - suffix;
   const additions = draftRules.slice(prefix, draftRules.length - suffix);
+  const built: string[] = [];
   for (let i = 0; i < additions.length; i++) {
-    const rendered = renderRule(additions[i], group);
-    if (rendered.reason) rejected.push({ rule: prefix + i + 1, reason: rendered.reason });
+    const item = buildAdd(additions[i], prefix + 1 + i);
+    if (item.reason) rejected.push({ rule: prefix + i + 1, reason: item.reason });
+    else built.push(item.command!);
   }
-  if (rejected.length) return { commands: [], rejected, error: "草稿里有无法无损写回的规则，阶段 A 不生成部分替换命令" };
+  if (rejected.length) return { commands: [], rejected, error: "草稿里有无法无损写回的规则，不生成部分替换命令" };
   for (let i = 0; i < removeCount; i++) commands.push([bin, "group", "rule", "rm", quote(group.id), String(prefix + 1)].join(" "));
-  for (let i = 0; i < additions.length; i++) {
-    if (!add(additions[i], prefix + i, prefix + 1 + i)) return { commands: [], rejected, error: "草稿里有无法无损写回的规则" };
-  }
+  commands.push(...built);
   return { commands, rejected };
 }

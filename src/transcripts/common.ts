@@ -1,5 +1,5 @@
 import { createReadStream } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 import type { Message, Part } from "../textprep";
@@ -12,14 +12,28 @@ export interface Transcript {
   agent: Agent; path: string; session: string; aliases: string[]; cwd: string;
   start: number; end: number; messages: TimedMessage[]; malformed: number;
 }
-export async function filesUnder(dir: string): Promise<string[]> {
+export async function filesUnder(dir: string, suffixes: string[] = [".jsonl"]): Promise<string[]> {
   let entries;
   try { entries = await readdir(dir, { withFileTypes: true }); }
   catch (err: any) { if (err.code === "ENOENT") return []; throw err; }
-  const paths = await Promise.all(entries.map(e => e.isDirectory() ? filesUnder(join(dir, e.name)) : Promise.resolve(e.isFile() && e.name.endsWith(".jsonl") ? [join(dir, e.name)] : [])));
+  const paths = await Promise.all(entries.map(e => e.isDirectory()
+    ? filesUnder(join(dir, e.name), suffixes)
+    : Promise.resolve(e.isFile() && suffixes.some(s => e.name.endsWith(s)) ? [join(dir, e.name)] : [])));
   return paths.flat().sort();
 }
 export async function* jsonLines(file: string): AsyncGenerator<{ row?: any; malformed?: boolean }> {
+  // Codex compresses old rollouts with zstd. Bun ships the codec, so this
+  // needs no external binary; a corrupt archive counts as one bad row.
+  if (file.endsWith(".zst")) {
+    let text: string;
+    try { text = new TextDecoder().decode(Bun.zstdDecompressSync(await readFile(file))); }
+    catch { yield { malformed: true }; return; }
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      try { yield { row: JSON.parse(line) }; } catch { yield { malformed: true }; }
+    }
+    return;
+  }
   const input = createReadStream(file, { encoding: "utf8" });
   const lines = createInterface({ input, crlfDelay: Infinity });
   try {

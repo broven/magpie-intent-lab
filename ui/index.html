@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Intent Lab · 意图回测</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>Intent Lab <span>意图回测</span></h1>
+    <p class="sub">用 magpie 路由过的历史会话，对比当前规则和草稿的 intent 分类与模型选择。写回只改 intent、use 和增删规则。</p>
+  </header>
+
+  <section class="panel" id="group-panel">
+    <div class="row">
+      <label for="group-select">路由组</label>
+      <select id="group-select" data-testid="group-select"></select>
+      <span id="group-meta" class="muted"></span>
+    </div>
+    <p id="unsupported" class="warn" hidden></p>
+    <div class="cols" style="margin-top:14px">
+      <div>
+        <h2>当前规则 <span class="muted">只读</span></h2>
+        <div id="current-rules" class="rules"><p class="empty-state">正在读取…</p></div>
+      </div>
+      <div>
+        <h2>草稿</h2>
+        <div id="draft-editor" data-testid="draft-editor">
+          <div class="row" style="margin-bottom:10px">
+            <label for="intent-sure">intentSure</label>
+            <input id="intent-sure" type="number" min="0" max="1" step="0.05" placeholder="默认 0.4">
+            <span class="muted">留空使用组默认值</span>
+          </div>
+          <div id="draft-rules" class="rules"></div>
+          <div class="row" style="margin-top:10px">
+            <button id="add-rule" type="button" class="secondary">＋ 添加规则</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="samples-panel">
+    <h2>样本条件</h2>
+    <div class="filter-row">
+      <label>从 <input type="date" id="from"></label>
+      <label>到 <input type="date" id="to"></label>
+      <fieldset>
+        <legend>agent</legend>
+        <label><input type="checkbox" class="agent" value="claude" checked> claude</label>
+        <label><input type="checkbox" class="agent" value="codex" checked> codex</label>
+        <label><input type="checkbox" class="agent" value="pi" checked> pi</label>
+      </fieldset>
+      <label>最近 <input type="number" id="limit-input" data-testid="limit-input" value="200" min="1" max="10000"> 个 turn</label>
+      <button id="run-button" data-testid="run-button" type="button">回测</button>
+    </div>
+    <div id="progress-wrap" class="progress-wrap" hidden>
+      <div class="bar"><div id="progress-fill" data-testid="progress"></div></div>
+      <div id="progress-text" class="progress-text">准备中…</div>
+    </div>
+    <p id="run-error" class="warn" hidden></p>
+  </section>
+
+  <section class="panel" id="summary-panel" hidden>
+    <h2>汇总</h2>
+    <div id="summary" data-testid="summary"></div>
+  </section>
+
+  <section class="panel" id="results-panel" hidden>
+    <h2>结果</h2>
+    <div class="filter-row">
+      <label><input type="checkbox" id="only-changed" data-testid="only-changed"> 只看变化</label>
+      <label>intent <select id="intent-filter" data-testid="intent-filter"><option value="">全部</option></select></label>
+    </div>
+    <div class="table-wrap">
+      <table id="result-table" data-testid="result-table">
+        <thead>
+          <tr>
+            <th style="width:13%">时间</th>
+            <th style="width:8%">agent</th>
+            <th style="width:12%">folder</th>
+            <th style="width:18%">消息摘要</th>
+            <th style="width:16%">当前 intent · sure · 模型</th>
+            <th style="width:16%">草稿 intent · sure · 模型</th>
+            <th style="width:8%">变化</th>
+            <th style="width:9%">unknown</th>
+          </tr>
+        </thead>
+        <tbody id="result-body"></tbody>
+      </table>
+      <div id="result-empty" class="empty-state">还没有回测结果。</div>
+    </div>
+  </section>
+
+  <section class="panel" id="apply-panel" hidden>
+    <h2>写回</h2>
+    <p class="muted">先预览将要执行的 magpie 命令，确认后再执行。执行完会读回该组的规则。</p>
+    <div class="row">
+      <button id="apply-preview" data-testid="apply-preview" type="button" class="secondary">预览命令</button>
+      <button id="apply-run" data-testid="apply-run" type="button" disabled>确认执行</button>
+    </div>
+    <p id="apply-status" class="muted" style="margin-top:10px">尚未预览。</p>
+    <p id="apply-error" class="warn" hidden></p>
+    <pre id="apply-commands" data-testid="apply-commands" hidden></pre>
+    <pre id="apply-readback" data-testid="apply-readback" hidden></pre>
+  </section>
+</div>
+<script src="/ui/app.js"></script>
+</body>
+</html>
