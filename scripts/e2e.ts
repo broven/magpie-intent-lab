@@ -195,8 +195,10 @@ try {
   for (const picked of multi) {
     const got = same.result.sessions.find((session: any) => session.id === picked.id);
     assert.ok(got, `session ${picked.id} must be in the result`);
-    assert.equal(got.turns, picked.turns, `session ${picked.id} turn count`);
-    assert.equal(got.rows.length, picked.turns, `session ${picked.id} row count`);
+    // A session an agent is still writing grows between the list and the
+    // run: the run's own count is the truth, never fewer than the list's.
+    assert.ok(got.turns >= picked.turns, `session ${picked.id} turn count ${got.turns} < listed ${picked.turns}`);
+    assert.equal(got.rows.length, got.turns, `session ${picked.id} row count`);
     for (let i = 0; i < got.rows.length; i++) assert.equal(got.rows[i].turn, i + 1, `session ${picked.id} rounds must be 1..n`);
   }
   check("E-2 three multi-turn sessions: rows = turns, turns 1..n", {
@@ -261,8 +263,10 @@ try {
   // 9: search a word from the first real sample's first message, then a real
   // bash command. The search only picks sessions; the run below replays all
   // turns of the picked sessions.
-  const firstMessage = samples.samples[0].fullText || samples.samples[0].text;
-  const word = (firstMessage.match(/[A-Za-z][A-Za-z0-9_-]{2,}/) ?? firstMessage.match(/\p{L}{2,}/) ?? ["git"])[0];
+  // A word from a session's own first message: a sample is any turn, and
+  // its words needn't be in its session's first message.
+  const firstMessage = catalog.sessions.map((session: any) => session.first ?? "").find((text: string) => /[A-Za-z][A-Za-z0-9_-]{3,}/.test(text)) ?? "git";
+  const word = (firstMessage.match(/[A-Za-z][A-Za-z0-9_-]{3,}/) ?? ["git"])[0];
   const firstSearch = await json(`/api/sessions?q=${encodeURIComponent(word)}&scopes=first&limit=100`);
   artifact.sessionSearch = { word, durationMs: firstSearch.durationMs, sessions: firstSearch.sessions.length };
   assert.ok(firstSearch.sessions.length >= 1, `first-message search for ${word} must find a session`);
