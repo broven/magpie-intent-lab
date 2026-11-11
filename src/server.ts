@@ -1,5 +1,5 @@
 import { readConfig, classifierSupport, type Group } from "./rules";
-import { readHistory, sessionPath, type Filters } from "./history";
+import { readHistory, sessionId, sessionPath, type Filters } from "./history";
 import { replay } from "./replay";
 import { JevClient } from "./jev";
 import { planApply, type ApplyPlan } from "./apply";
@@ -211,7 +211,7 @@ function makeFetch(jev: JevClient, magpieBin: string) {
             return {
               ...g, intentSure: g.intentSure ?? null,
               supported: support.supported, reason: support.reason ?? null,
-              logic: logicFor(g),
+              logic: logicFor(),
             };
           });
         return json({ groups });
@@ -267,29 +267,31 @@ function makeFetch(jev: JevClient, magpieBin: string) {
         } catch (err: any) {
           return failure(400, err.message ?? String(err));
         }
-        let sessions: string[] | undefined;
-        if (body?.sessions !== undefined) {
-          if (!Array.isArray(body.sessions) || body.sessions.some((id: unknown) => typeof id !== "string")) {
-            return failure(400, "sessions 必须是会话 id 数组");
-          }
-          if (!body.sessions.length) return failure(400, "sessions 不能为空");
-          sessions = body.sessions.map((id: string) => sessionPath(id));
+        if (!Array.isArray(body?.sessions) || body.sessions.some((id: unknown) => typeof id !== "string")) {
+          return failure(400, "sessions 必须是会话 id 数组");
         }
+        if (!body.sessions.length) return failure(400, "sessions 不能为空");
+        const k = body?.k === undefined ? 3 : Number(body.k);
+        if (!Number.isInteger(k) || k < 1 || k > 10_000) return failure(400, "k 必须是 1…10000 的整数");
+        if (body?.stopAfterHit !== undefined && typeof body.stopAfterHit !== "boolean") {
+          return failure(400, "stopAfterHit 必须是布尔值");
+        }
+        const sessions = body.sessions.map((id: string) => sessionPath(id));
         const encoder = new TextEncoder();
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
             (async () => {
               try {
                 sse(controller, encoder, "progress", { done: 0, total: 0, phase: "history" });
-                const history = await readHistory({
-                  agents: body?.agents, from: body?.from, to: body?.to, limit: body?.limit,
-                  sessions,
-                });
-                if (!history.samples.length) throw new Error("没有符合条件的样本");
+                const history = await readHistory({ sessions, limit: 10_000, all: true });
+                if (!history.samples.length) throw new Error("选中的会话没有可回测的轮次");
+                const got = new Set(history.samples.map(sample => sample.session));
+                const missing = sessions.filter(path => !got.has(path));
+                if (missing.length) throw new Error(`会话没有可回测的轮次: ${missing.map(path => sessionId(path)).join(", ")}`);
                 sse(controller, encoder, "progress", { done: 0, total: history.samples.length, phase: "replay" });
                 const result = await replay(jev, group!, group!, draft, history.samples, (done, total) => {
                   sse(controller, encoder, "progress", { done, total, phase: "replay" });
-                });
+                }, { k, stopAfterHit: body?.stopAfterHit === true });
                 sse(controller, encoder, "result", { ...result, stats: history.stats, cache: { ...jev.stats } });
                 controller.close();
               } catch (err: any) {

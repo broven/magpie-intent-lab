@@ -61,8 +61,8 @@ async function json(path: string, body?: unknown) {
   if (!response.ok) throw Error(`${path}: HTTP ${response.status} ${await response.text()}`);
   return response.json() as Promise<any>;
 }
-async function run(body: unknown) {
-  const response = await fetch(base + "/api/run", { method: "POST", headers: { "content-type": "application/json", ...auth() }, body: JSON.stringify(body) });
+async function runAt(urlBase: string, tokenValue: string, body: unknown) {
+  const response = await fetch(urlBase + "/api/run", { method: "POST", headers: { "content-type": "application/json", "x-intent-lab-token": tokenValue }, body: JSON.stringify(body) });
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
   const events: any[] = [];
@@ -88,6 +88,48 @@ async function run(body: unknown) {
   assert.ok(events.some(e => e.event === "progress"), "SSE must report progress");
   assert.ok(result, "SSE must end with a result");
   return { result, events };
+}
+const run = (body: unknown) => runAt(base, token, body);
+
+async function startLab(cacheDir: string) {
+  const proc = Bun.spawn([process.execPath, join(root, "src/server.ts")], {
+    cwd: root,
+    env: {
+      ...process.env, INTENT_LAB_PORT: "0",
+      INTENT_LAB_MAGPIE_ENV: JSON.stringify(cliEnv),
+      INTENT_LAB_DIR: cacheDir,
+    },
+    stdout: "pipe",
+    stderr: "inherit",
+  });
+  let url = "";
+  const pump = (async () => {
+    const reader = proc.stdout.getReader();
+    let buffer = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += new TextDecoder().decode(value);
+      let end: number;
+      while ((end = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
+        const hit = /^intent-lab listening (http:\/\/127\.0\.0\.1:\d+)$/.exec(line);
+        if (hit) url = hit[1]; else if (line) console.log(line);
+      }
+    }
+  })();
+  const deadline = Date.now() + 15_000;
+  while (!url && Date.now() < deadline && proc.exitCode === null) await Bun.sleep(50);
+  if (!url) throw new Error("fresh service did not announce a port");
+  const pageHtml = await (await fetch(url + "/")).text();
+  const pageToken = pageHtml.match(/name="intent-lab-token" content="([0-9a-f]{64})"/)?.[1] ?? "";
+  if (!pageToken) throw new Error("fresh service page has no token");
+  return {
+    base: url,
+    token: pageToken,
+    run: (body: unknown) => runAt(url, pageToken, body),
+    stop: async () => { proc.kill(); await proc.exited; await pump; },
+  };
 }
 try {
   const deadline = Date.now() + 15_000;
@@ -117,20 +159,58 @@ try {
     console.log(`${agent} routing=${s.routingRecords} linked=${s.linkedRecords} transcripts=${s.transcripts} hitRate=${(100 * s.hitRate).toFixed(2)}% turns=${s.turns} ambiguous=${s.ambiguous}`);
   }
   check("2 real samples and association stats", { samples: samples.samples.length });
+
+  // E-1: the catalog without q is the recent N sessions, by last turn desc.
+  const firstPage = await json("/api/sessions?limit=10");
+  artifact.catalog = firstPage;
+  assert.equal(firstPage.sessions.length, 10, "the catalog must list exactly 10 sessions");
+  for (const session of firstPage.sessions) {
+    assert.ok(session.id && session.lastTurn && Number.isInteger(session.turns), "each catalog session needs id/lastTurn/turns");
+    assert.ok(session.turns >= 1, "a listed session must have a turn");
+  }
+  for (let i = 1; i < firstPage.sessions.length; i++) {
+    assert.ok(firstPage.sessions[i - 1].lastTurn >= firstPage.sessions[i].lastTurn, "catalog must be sorted by last turn desc");
+  }
+  check("E-1 catalog: 10 sessions sorted by last turn desc", {
+    first: firstPage.sessions[0].lastTurn, last: firstPage.sessions.at(-1).lastTurn,
+  });
+
+  const catalog = await json("/api/sessions?limit=100");
+  const multi = catalog.sessions.filter((session: any) => session.turns > 1).slice(0, 3);
+  assert.equal(multi.length, 3, "the catalog must hold at least 3 multi-turn sessions");
+  const single = catalog.sessions.find((session: any) => session.turns === 1);
+  assert.ok(single, "the catalog must hold a single-turn session");
+  artifact.catalogPicked = { multi: multi.map((session: any) => ({ id: session.id, turns: session.turns })), single: { id: single.id, turns: single.turns } };
   const draft = { rules: structuredClone(group.rules), intentSure: group.intentSure };
-  const same = await run({ group: group.id, draft, limit: 30 });
+  const same = await run({ group: group.id, draft, sessions: multi.map((session: any) => session.id), k: 3, stopAfterHit: false });
   artifact.identical = same;
-  assert.ok(same.result.rows.length >= 1);
-  assert.ok(same.result.rows.every((r: any) => r.changed === false), "identical rules must produce identical rows");
+  const sameRows = same.result.sessions.flatMap((session: any) => session.rows);
+  assert.ok(sameRows.length >= 1);
+  assert.ok(sameRows.every((r: any) => r.changed === false), "identical rules must produce identical rows");
   assert.equal(same.result.summary.changed, 0);
-  check("3 identical draft changed=0", { rows: same.result.rows.length, cache: same.result.cache });
+  check("3 identical draft changed=0", { sessions: same.result.sessions.length, rows: sameRows.length, cache: same.result.cache });
+
+  // E-2: each selected session replays every turn, numbered from 1.
+  assert.equal(same.result.sessions.length, 3, "E-2 must return the three selected sessions");
+  for (const picked of multi) {
+    const got = same.result.sessions.find((session: any) => session.id === picked.id);
+    assert.ok(got, `session ${picked.id} must be in the result`);
+    assert.equal(got.turns, picked.turns, `session ${picked.id} turn count`);
+    assert.equal(got.rows.length, picked.turns, `session ${picked.id} row count`);
+    for (let i = 0; i < got.rows.length; i++) assert.equal(got.rows[i].turn, i + 1, `session ${picked.id} rounds must be 1..n`);
+  }
+  check("E-2 three multi-turn sessions: rows = turns, turns 1..n", {
+    sessions: same.result.sessions.map((session: any) => ({ id: session.id, turns: session.turns, rows: session.rows.length })),
+  });
+
   const edited = structuredClone(draft);
   for (const rule of edited.rules) if (rule.intent) rule.intent = "写代码或改代码";
-  const changed = await run({ group: group.id, draft: edited, limit: 30 });
+  const changed = await run({ group: group.id, draft: edited, sessions: multi.map((session: any) => session.id), k: 3, stopAfterHit: false });
   artifact.edited = changed;
-  assert.ok(changed.result.rows.some((r: any) => r.changed === true), "edited intent must change at least one row");
+  const changedRows = changed.result.sessions.flatMap((session: any) => session.rows);
+  assert.ok(changedRows.some((r: any) => r.changed === true), "edited intent must change at least one row");
   assert.ok(changed.result.summary.changed > 0);
-  check(`4 edited intent changed=${changed.result.summary.changed}`, { rows: changed.result.rows.length, cache: changed.result.cache });
+  check(`4 edited intent changed=${changed.result.summary.changed}`, { rows: changedRows.length, cache: changed.result.cache });
   const commands = await json("/api/apply", { group: group.id, draft: edited, dryRun: true });
   artifact.apply = commands;
   assert.ok(Array.isArray(commands.commands) && commands.commands.length > 0);
@@ -158,7 +238,7 @@ try {
     readBack: real.readBack.split("\n").filter(Boolean).slice(0, 3),
   });
   const html = await (await fetch(base + "/")).text();
-  const anchors = ["draft-editor", "run-button", "result-table", "group-select", "limit-input", "summary", "apply-preview", "apply-run"];
+  const anchors = ["draft-editor", "run-button", "group-select", "session-list", "session-limit", "k-input", "stop-after-hit", "timing-filter", "session-results", "summary", "apply-preview", "apply-run"];
   for (const anchor of anchors) assert.ok(html.includes(`data-testid="${anchor}"`), `UI must contain data-testid=${anchor}`);
   check("7 UI anchors", { anchors });
   // 8: the frame's page and the service's guard. magpie's page policy runs
@@ -204,31 +284,135 @@ try {
   assert.ok(bashSearch.durationMs < 5000, `full bash search must be under 5s, took ${bashSearch.durationMs}ms`);
   console.log(`search bash "${bashQuery}": ${bashSearch.sessions.length} sessions in ${bashSearch.durationMs}ms`);
   check("9 session search first-message and bash", { word, first: firstSearch.sessions.length, bash: bashSearch.sessions.length });
-  // 10: two selected sessions. Every returned row must belong to one of
-  // them, and each session's rows must equal its in-range turn count.
-  const picked = firstSearch.sessions.slice(0, 2);
-  assert.equal(picked.length, 2, "the first search must return at least two sessions for this check");
-  const restricted = await run({ group: group.id, draft, sessions: picked.map((session: any) => session.id) });
-  artifact.sessionRun = { picked: picked.map((session: any) => ({ id: session.id, turns: session.turns })), rows: restricted.result.rows.length };
-  assert.ok(restricted.result.rows.length > 0, "selected sessions must replay turns");
-  const allowed = new Set(picked.map((session: any) => session.id));
-  for (const row of restricted.result.rows) assert.ok(allowed.has(row.sessionId), `row ${row.id} is outside the picked sessions`);
-  const counts = new Map<string, number>();
-  for (const row of restricted.result.rows) counts.set(row.sessionId, (counts.get(row.sessionId) ?? 0) + 1);
-  for (const session of picked) assert.equal(counts.get(session.id) ?? 0, session.turns, `session ${session.id} row count must equal its turn count`);
-  check("10 selected sessions only; per-session row counts", { sessions: picked.length, rows: restricted.result.rows.length });
-  // 11: every row carries the trace captured by the replay itself.
-  for (const row of restricted.result.rows) {
-    for (const side of ["current", "draft"] as const) {
-      const trace = row[side]?.trace;
-      assert.ok(trace, `row ${row.id} ${side} must have a trace`);
-      assert.equal(trace.jevRequest.state.message, row.text, `row ${row.id} ${side} request message must be the replayed text`);
-      assert.equal(trace.chosen.n, row[side].rule, `row ${row.id} ${side} chosen rule must match the result`);
-      assert.equal(trace.ruleWalk.find((rule: any) => rule.chosen)?.n ?? 0, row[side].rule, `row ${row.id} ${side} rule walk must agree`);
-      if (trace.jevAnswer?.topic) assert.equal(trace.passed, trace.sure >= trace.threshold, `row ${row.id} ${side} topic passed must be sure >= threshold`);
+  // E-3: timing classes, first hit and the histogram, all from the draft side.
+  const timingIds = [...multi.map((session: any) => session.id), single.id];
+  const timingUse = group.rules.find((rule: any) => rule.use)?.use;
+  const timingOther = group.members.find((member: string) => member !== timingUse);
+  assert.ok(timingUse && timingOther, "claude-opus must have two members for the timing switch");
+  const baseRun = await run({ group: group.id, draft, sessions: timingIds, k: 3, stopAfterHit: false });
+  // A rule whose message condition appears only in a later turn gives E-3 a
+  // real mid-hit session, a later first hit and a switch cost, without
+  // depending on a particular classifier answer. Choose a phrase unique to
+  // that turn across every replayed session.
+  // The first turn of a mid-hit session must have a known actual member, so
+  // the synthetic late rule can show a real switch cost.
+  const midBase = baseRun.result.sessions.find((session: any) => session.turns >= 4 && session.rows[0].initialMember);
+  assert.ok(midBase, "E-3 needs a multi-turn session with a known initial member");
+  const targetTurn = Math.min(4, midBase.turns);
+  const targetRow = midBase.rows[targetTurn - 1];
+  const others = baseRun.result.sessions
+    .flatMap((session: any) => session.rows)
+    .filter((row: any) => row.id !== targetRow.id)
+    .map((row: any) => row.fullText);
+  const chars = Array.from(targetRow.fullText);
+  let phrase = "";
+  for (let length = 16; length <= 64 && !phrase; length += 4) {
+    for (let start = 0; start + length <= chars.length; start++) {
+      const candidate = chars.slice(start, start + length).join("");
+      if (!candidate.includes("\n") && !others.some((text: string) => text.includes(candidate))) {
+        phrase = candidate;
+        break;
+      }
     }
   }
-  check("11 per-row trace", { rows: restricted.result.rows.length, sides: ["current", "draft"] });
+  assert.ok(phrase, "E-3 must find a phrase unique to a later turn");
+  const previousMember = midBase.rows[targetTurn - 2]?.draft.member || midBase.rows[targetTurn - 1].initialMember;
+  const switchTo = group.members.find((member: string) => member !== previousMember) ?? timingOther;
+  const timingDraft = structuredClone(draft);
+  timingDraft.rules.push({ use: switchTo, where: [{ field: "message", op: "contains", value: phrase }] });
+  const timingRun = await run({ group: group.id, draft: timingDraft, sessions: timingIds, k: 3, stopAfterHit: false });
+  artifact.timing = { base: baseRun.result, midPhrase: phrase, midTurn: targetTurn, result: timingRun.result };
+  assert.ok(timingRun.result.sessions.some((session: any) => session.class === "mid"), "E-3 must exercise a mid-hit session");
+  assert.ok(timingRun.result.summary.timing.midCost.switches > 0, "E-3 mid hit must carry a switch cost");
+  assert.equal(timingRun.result.sessions.length, 4, "E-3 must return all four selected sessions");
+  const byId = new Map(timingRun.result.sessions.map((session: any) => [session.id, session]));
+  const histogram: Record<string, number> = { "1": 0, "2": 0, "3": 0, "4-5": 0, "6-10": 0, ">10": 0 };
+  const classes: Record<string, number> = { single: 0, early: 0, mid: 0, miss: 0 };
+  for (const id of timingIds) {
+    const session: any = byId.get(id);
+    assert.ok(session, `session ${id} must be in the timing run`);
+    const expectedFirst = session.rows.find((row: any) => !row.draft.stopped && row.draft.rule > 0)?.turn ?? null;
+    assert.equal(session.firstHit, expectedFirst, `session ${id} firstHit must be the first draft rule hit`);
+    const expectedClass = session.turns === 1 ? "single" : expectedFirst === null ? "miss" : expectedFirst <= 3 ? "early" : "mid";
+    assert.equal(session.class, expectedClass, `session ${id} class`);
+    classes[expectedClass]++;
+    if (expectedFirst !== null) {
+      const bin = expectedFirst === 1 ? "1" : expectedFirst === 2 ? "2" : expectedFirst === 3 ? "3" : expectedFirst <= 5 ? "4-5" : expectedFirst <= 10 ? "6-10" : ">10";
+      histogram[bin]++;
+    }
+    const switched = session.rows.filter((row: any) => row.draft.switched);
+    assert.equal(session.switched, switched.length > 0, `session ${id} switch flag`);
+    assert.equal(session.prefixTokens, switched.reduce((sum: number, row: any) => sum + row.draft.prefixTokens, 0), `session ${id} switch cost`);
+    if (switched.length) {
+      assert.equal(session.from, switched[0].draft.from, `session ${id} switch from`);
+      assert.equal(session.to, switched[0].draft.member, `session ${id} switch to`);
+    }
+  }
+  assert.equal(classes.single, 1, "one single-turn session must be counted separately");
+  assert.equal(timingRun.result.summary.timing.single, classes.single);
+  assert.equal(timingRun.result.summary.timing.early, classes.early);
+  assert.equal(timingRun.result.summary.timing.mid, classes.mid);
+  assert.equal(timingRun.result.summary.timing.miss, classes.miss);
+  assert.equal(timingRun.result.summary.timing.multi, classes.early + classes.mid + classes.miss);
+  for (const bin of Object.keys(histogram)) {
+    assert.equal(timingRun.result.summary.timing.histogram[bin], histogram[bin], `histogram bin ${bin}`);
+  }
+  const midRows = timingRun.result.sessions
+    .filter((session: any) => session.class === "mid")
+    .flatMap((session: any) => session.rows.filter((row: any) => row.draft.switched));
+  const midCosts = midRows.map((row: any) => row.draft.prefixTokens).sort((a: number, b: number) => a - b);
+  const midMedian = midCosts.length
+    ? Math.round(midCosts.length % 2 ? midCosts[(midCosts.length - 1) / 2] : (midCosts[midCosts.length / 2 - 1] + midCosts[midCosts.length / 2]) / 2)
+    : 0;
+  assert.equal(timingRun.result.summary.timing.midCost.switches, midCosts.length);
+  assert.equal(timingRun.result.summary.timing.midCost.prefixTokens, midCosts.reduce((sum: number, value: number) => sum + value, 0));
+  assert.equal(timingRun.result.summary.timing.midCost.median, midMedian);
+  check("E-3 timing classes, firstHit, histogram and mid-hit cost", {
+    classes, histogram, midCost: timingRun.result.summary.timing.midCost,
+  });
+
+  // E-4: stopAfterHit must skip the draft's later turns and strictly cut
+  // actual Jev requests. Two fresh service processes give both runs an empty
+  // cache, so the count is not hidden by the first run's answers.
+  // edited differs from current in the request bytes (so the draft is not
+  // served from the current side's answers) and hits early in these sessions.
+  const e4Draft = edited;
+  const labOff = await startLab(join(sandbox, "cache-off"));
+  let e4Off: any;
+  try {
+    e4Off = await labOff.run({ group: group.id, draft: e4Draft, sessions: timingIds, k: 3, stopAfterHit: false });
+  } finally {
+    await labOff.stop();
+  }
+  const labOn = await startLab(join(sandbox, "cache-on"));
+  let e4On: any;
+  try {
+    e4On = await labOn.run({ group: group.id, draft: e4Draft, sessions: timingIds, k: 3, stopAfterHit: true });
+  } finally {
+    await labOn.stop();
+  }
+  const offRequests = e4Off.result.summary.jev.draft.requests;
+  const onRequests = e4On.result.summary.jev.draft.requests;
+  assert.ok(offRequests > 0, "the stop-off draft must make actual Jev requests");
+  assert.ok(onRequests < offRequests, `stopAfterHit must make fewer draft requests: ${onRequests} !< ${offRequests}`);
+  const offSessions = new Map(e4Off.result.sessions.map((session: any) => [session.id, session]));
+  const onSessions = new Map(e4On.result.sessions.map((session: any) => [session.id, session]));
+  for (const id of timingIds) {
+    const a: any = offSessions.get(id), b: any = onSessions.get(id);
+    assert.ok(a && b, `E-4 session ${id} must be in both runs`);
+    assert.equal(b.class, a.class, `E-4 session ${id} class must not change`);
+    assert.equal(b.firstHit, a.firstHit, `E-4 session ${id} firstHit must not change`);
+  }
+  assert.ok(e4On.result.sessions.some((session: any) => session.rows.some((row: any) => row.draft.stopped)), "stopAfterHit must mark later turns unjudged");
+  artifact.stopAfterHit = {
+    offDraftRequests: offRequests, onDraftRequests: onRequests,
+    offAll: e4Off.result.summary.jev, onAll: e4On.result.summary.jev,
+    classes: e4On.result.sessions.map((session: any) => ({ id: session.id, class: session.class, firstHit: session.firstHit, stopped: session.rows.filter((row: any) => row.draft.stopped).length })),
+  };
+  console.log(`E-4 offDraftRequests=${offRequests} onDraftRequests=${onRequests} classes=${e4On.result.sessions.map((session: any) => `${session.class}/${session.firstHit}`).join(",")}`);
+  check("E-4 stopAfterHit cuts draft Jev requests; class/firstHit identical", {
+    offDraftRequests: offRequests, onDraftRequests: onRequests,
+  });
   // 12: rerun the turnIn probe over every sample the plugin produces. A
   // sample must be the message that opened a new turn (turnIn within false);
   // the messages turnIn keeps inside the previous turn are not samples.
@@ -270,8 +454,8 @@ try {
   assert.ok(currentUse && otherMember, "claude-opus must have two members to switch between");
   const stickyDraft = structuredClone(draft);
   for (const rule of stickyDraft.rules) rule.use = otherMember;
-  const stickyRun = await run({ group: group.id, draft: stickyDraft, sessions: [switchSession.id] });
-  const stickyRows = stickyRun.result.rows;
+  const stickyRun = await run({ group: group.id, draft: stickyDraft, sessions: [switchSession.id], k: 3, stopAfterHit: false });
+  const stickyRows = stickyRun.result.sessions.flatMap((session: any) => session.rows);
   const bySession = new Map<string, any[]>();
   for (const row of stickyRows) {
     const list = bySession.get(row.session);

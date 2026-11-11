@@ -23,6 +23,7 @@ export interface SessionSummary {
   folder: string;
   start: string;
   end: string;
+  lastTurn: string;
   first: string;
   hits: number;
   snippets: SearchSnippet[];
@@ -69,11 +70,16 @@ const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // linked-session result briefly so the second query does not reread routing
 // and every transcript; transcript parsing itself stays mtime-cached.
 const historyCache = new Map<string, { at: number; value: ReturnType<typeof readHistory> }>();
-const HISTORY_TTL = 30_000;
+// A catalog read parses every transcript; keep it warm across a search and
+// its follow-up scopes. Transcript parsing itself stays mtime-cached.
+const HISTORY_TTL = 5 * 60_000;
 async function historyFor(filters: Filters, home: string) {
   const key = JSON.stringify([filters.agents ?? "", filters.from ?? "", filters.to ?? "", home]);
   const old = historyCache.get(key);
-  if (old && Date.now() - old.at < HISTORY_TTL) return old.value;
+  if (old && Date.now() - old.at < HISTORY_TTL) {
+    old.at = Date.now();
+    return old.value;
+  }
   // The promise is kept, not its value: a search made while the start-up
   // warm-up is still reading shares that read instead of doing it again.
   const value = readHistory(filters, home);
@@ -178,14 +184,17 @@ function searchTexts(t: Transcript, scopes: Set<SearchScope>): { scope: SearchSc
 export async function searchSessions(query: SessionSearch, home = homedir()): Promise<SessionSearchResult> {
   const started = performance.now();
   const q = trimSpace(query.q ?? "");
-  if (!q) return { sessions: [], durationMs: Math.round(performance.now() - started) };
-  const scopes = scopesOf(query.scopes);
-  let re: RegExp;
-  try { re = matcher(q, !!query.regex); } catch (err: any) { throw new Error(`正则无效: ${err?.message ?? err}`); }
-  const limit = query.limit ?? 100;
+  const selected = range(query);
+  const scopes = q ? scopesOf(query.scopes) : new Set<SearchScope>();
+  let re: RegExp | null = null;
+  if (q) {
+    try { re = matcher(q, !!query.regex); } catch (err: any) { throw new Error(`正则无效: ${err?.message ?? err}`); }
+  }
+  const limit = query.limit ?? 30;
   if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error("limit 必须是 1…1000 的整数");
-  const filters: Filters = { agents: query.agents, from: query.from, to: query.to, limit: 10_000, all: true };
-  const history = await historyFor(filters, home);
+  // The catalog always reads every turn of a session. A date range picks the
+  // sessions by their last turn; it must not cut the replayed session short.
+  const history = await historyFor({ agents: query.agents, limit: 10_000, all: true }, home);
   const bySession = new Map<string, Sample[]>();
   for (const sample of history.samples) {
     const list = bySession.get(sample.session);
@@ -193,28 +202,34 @@ export async function searchSessions(query: SessionSearch, home = homedir()): Pr
   }
   const sessions: SessionSummary[] = [];
   for (const [path, samples] of bySession) {
+    const lastTurn = samples.at(-1)?.time ?? "";
+    const at = Date.parse(lastTurn);
+    if (!(at >= selected.from && at <= selected.to)) continue;
     const agent = samples[0].agent;
     const t = await readTranscript(path, agent);
     let hits = 0;
     const snippets: SearchSnippet[] = [];
-    for (const item of searchTexts(t, scopes)) {
-      const found = matches(item.text, re);
-      hits += found.length;
-      for (const hit of found) {
-        if (snippets.length < 3) snippets.push(snippet(item.text, hit, item.scope));
+    if (q && re) {
+      for (const item of searchTexts(t, scopes)) {
+        const found = matches(item.text, re);
+        hits += found.length;
+        for (const hit of found) {
+          if (snippets.length < 3) snippets.push(snippet(item.text, hit, item.scope));
+        }
       }
+      if (!hits) continue;
     }
-    if (!hits) continue;
     const first = firstUser(t);
     sessions.push({
       id: sessionId(path), agent, folder: t.cwd || samples[0].folder,
       start: t.start ? new Date(t.start).toISOString() : samples[0].time,
-      end: t.end ? new Date(t.end).toISOString() : samples[0].time,
+      end: t.end ? new Date(t.end).toISOString() : lastTurn,
+      lastTurn,
       first: cutMiddle(first, 240, 0),
       hits, snippets, turns: samples.length,
     });
   }
-  sessions.sort((a, b) => b.hits - a.hits || b.start.localeCompare(a.start));
+  sessions.sort((a, b) => (q ? b.hits - a.hits : 0) || b.lastTurn.localeCompare(a.lastTurn) || a.id.localeCompare(b.id));
   return {
     sessions: sessions.slice(0, limit),
     durationMs: Math.round(performance.now() - started),

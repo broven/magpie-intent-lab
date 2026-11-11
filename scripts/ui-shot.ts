@@ -69,15 +69,7 @@ try {
   const page = await browser.newPage({ viewport: { width: 1100, height: 900 }, colorScheme: "light" });
   await page.goto(base + "/", { waitUntil: "networkidle" });
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="group-select"] option').length > 0);
-  await page.selectOption('[data-testid="group-select"]', "claude-opus");
-  await page.fill('[data-testid="limit-input"]', "20");
-  await page.click('[data-testid="run-button"]');
-  await page.waitForFunction(
-    () => document.querySelectorAll('[data-testid="result-table"] tbody tr.result-row').length > 0,
-    undefined,
-    { timeout: 240_000 },
-  );
-  await page.waitForTimeout(300);
+  await page.waitForSelector("#session-list .session-card", { timeout: 60_000 });
 
   await page.setViewportSize({ width: 1100, height: 900 });
   await page.screenshot({ path: join(artifactDir, "ui-1100.png"), fullPage: true });
@@ -110,115 +102,53 @@ try {
   console.log("PASS logic-420.png", JSON.stringify(logic420));
 
   await page.setViewportSize({ width: 1100, height: 900 });
-  let searched = false;
-  for (const term of ["git", "the"]) {
-    await page.fill('[data-testid="session-search"]', term);
-    for (const scope of ["user", "reply", "bash"]) await page.check(`input.scope[value="${scope}"]`);
-    await page.click('[data-testid="session-search-button"]');
-    try {
-      await page.waitForSelector(".session-card", { timeout: 60_000 });
-      searched = true;
-      break;
-    } catch { /* try the next common word */ }
-  }
-  if (!searched) throw new Error("ui-shot session search listed no sessions");
-  await page.locator("#session-panel").screenshot({ path: join(artifactDir, "sessions-1100.png") });
-  console.log("PASS sessions-1100.png");
+  await page.locator("#session-panel").screenshot({ path: join(artifactDir, "panel-1100.png") });
+  console.log("PASS panel-1100.png");
   await page.setViewportSize({ width: 420, height: 900 });
-  const sessions420 = await noHorizontalScroll(page, 420);
-  await page.locator("#session-panel").screenshot({ path: join(artifactDir, "sessions-420.png") });
-  console.log("PASS sessions-420.png", JSON.stringify(sessions420));
+  const panel420 = await noHorizontalScroll(page, 420);
+  await page.locator("#session-panel").screenshot({ path: join(artifactDir, "panel-420.png") });
+  console.log("PASS panel-420.png", JSON.stringify(panel420));
 
   await page.setViewportSize({ width: 1100, height: 900 });
-  await page.click('[data-testid="session-preview"]');
-  await page.waitForSelector("#session-modal:not([hidden])");
-  await page.locator("#session-modal .modal-dialog").screenshot({ path: join(artifactDir, "preview-1100.png") });
-  console.log("PASS preview-1100.png");
-  await page.setViewportSize({ width: 420, height: 900 });
-  const preview420 = await noHorizontalScroll(page, 420);
-  await page.locator("#session-modal .modal-dialog").screenshot({ path: join(artifactDir, "preview-420.png") });
-  console.log("PASS preview-420.png", JSON.stringify(preview420));
-  await page.keyboard.press("Escape");
-  await page.waitForSelector("#session-modal", { state: "hidden" });
-
-  await page.setViewportSize({ width: 1100, height: 900 });
-  await page.click('[data-testid="result-table"] tbody tr.result-row');
-  await page.waitForSelector("tr.detail");
-  await page.locator("tr.detail").screenshot({ path: join(artifactDir, "trace-1100.png") });
-  console.log("PASS trace-1100.png");
-  await page.setViewportSize({ width: 420, height: 900 });
-  const trace420 = await noHorizontalScroll(page, 420);
-  await page.locator("tr.detail").screenshot({ path: join(artifactDir, "trace-420.png") });
-  console.log("PASS trace-420.png", JSON.stringify(trace420));
-
-  // A second run restricted to one known session, with a draft that hits the
-  // rule, shows the actual-model columns and a switch marker. Restricting the
-  // session keeps the screenshot and the classifier calls small.
-  await page.setViewportSize({ width: 1100, height: 900 });
-  // The earlier screenshots left a search active; clear it so the next
-  // waitForSelector cannot match its stale cards.
-  await page.click("#session-clear");
-  await page.fill('[data-testid="session-search"]', "cheaperinference");
-  await page.check('input.scope[value="user"]');
-  await page.click('[data-testid="session-search-button"]');
-  await page.waitForFunction(
-    () => (document.querySelector("#session-status")?.textContent || "").includes("命中"),
-    undefined,
-    { timeout: 60_000 },
-  );
-  await page.waitForSelector(".session-card", { timeout: 60_000 });
+  // Make the screenshot show hit turns, not an all-miss timeline.
   await page.evaluate(() => {
-    // Match the session's own first message, not the whole card: snippets
-    // quote any user text, including this script's own phrase, and selecting
-    // one of those would replay the wrong session.
-    const cards = [...document.querySelectorAll(".session-card")];
-    const target = cards.find(card => (card.querySelector(".session-first")?.textContent || "").includes("我想做llm reseller"));
-    if (!target) throw new Error("switch screenshot session not found");
-    for (const card of cards) {
-      if (card === target) continue;
-      const box = card.querySelector('[data-testid="session-checkbox"]');
-      if (box?.checked) {
-        box.checked = false;
-        box.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-    }
-    const box = target.querySelector('[data-testid="session-checkbox"]');
-    if (!box?.checked) {
-      box.checked = true;
-      box.dispatchEvent(new Event("change", { bubbles: true }));
-    }
     for (const input of document.querySelectorAll('#draft-rules input[type="text"]')) {
       input.value = "写代码或改代码";
       input.dispatchEvent(new Event("input", { bubbles: true }));
     }
   });
+  await page.click('[data-testid="session-select-none"]');
+  const boxes = await page.$$('[data-testid="session-checkbox"]');
+  if (boxes.length < 3) throw new Error(`need at least 3 sessions for screenshots, got ${boxes.length}`);
+  for (const box of boxes.slice(0, 3)) await box.check();
   const selected = await page.evaluate(() => state.selectedSessions.size);
-  if (selected !== 1) throw new Error(`expected one selected session for the switch screenshot, got ${selected}`);
-  const rowsBefore = await page.locator('[data-testid="result-table"] tbody tr.result-row').count();
+  if (selected !== 3) throw new Error(`expected 3 selected sessions, got ${selected}`);
   await page.click('[data-testid="run-button"]');
-  // The first run's rows stay in the table until the second result arrives.
   await page.waitForFunction(
-    previous => {
-      const count = document.querySelectorAll('[data-testid="result-table"] tbody tr.result-row').length;
-      return count > 0 && count !== previous;
-    },
-    rowsBefore,
+    () => document.querySelectorAll('[data-testid="session-result"]').length === 3,
+    undefined,
     { timeout: 300_000 },
   );
-  await page.waitForFunction(
-    () => document.querySelectorAll('[data-testid="switch-mark"]').length > 0,
-    undefined,
-    { timeout: 30_000 },
-  );
-  const switchMarks = await page.locator('[data-testid="switch-mark"]').count();
-  await page.locator("#results-panel").screenshot({ path: join(artifactDir, "results-1100.png") });
-  console.log(`PASS results-1100.png switches=${switchMarks}`);
+  await page.waitForSelector('[data-testid="turn-cell"]', { timeout: 10_000 });
+  await page.locator("#results-panel").screenshot({ path: join(artifactDir, "main-1100.png") });
+  console.log("PASS main-1100.png");
   await page.setViewportSize({ width: 420, height: 900 });
-  const results420 = await noHorizontalScroll(page, 420);
-  await page.locator("#results-panel").screenshot({ path: join(artifactDir, "results-420.png") });
-  console.log("PASS results-420.png", JSON.stringify(results420));
+  const main420 = await noHorizontalScroll(page, 420);
+  await page.locator("#results-panel").screenshot({ path: join(artifactDir, "main-420.png") });
+  console.log("PASS main-420.png", JSON.stringify(main420));
 
-  const shots = ["ui-1100.png", "ui-420.png", "ui-1100-dark.png", "ui-420-dark.png", "logic-1100.png", "logic-420.png", "sessions-1100.png", "sessions-420.png", "preview-1100.png", "preview-420.png", "trace-1100.png", "trace-420.png", "results-1100.png", "results-420.png"];
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await page.click('[data-testid="session-result-head"]');
+  await page.waitForSelector('[data-testid="turn-row"]', { timeout: 10_000 });
+  const expanded = page.locator("#session-results .session-result").first();
+  await expanded.screenshot({ path: join(artifactDir, "expanded-1100.png") });
+  console.log("PASS expanded-1100.png");
+  await page.setViewportSize({ width: 420, height: 900 });
+  const expanded420 = await noHorizontalScroll(page, 420);
+  await expanded.screenshot({ path: join(artifactDir, "expanded-420.png") });
+  console.log("PASS expanded-420.png", JSON.stringify(expanded420));
+
+  const shots = ["ui-1100.png", "ui-420.png", "ui-1100-dark.png", "ui-420-dark.png", "logic-1100.png", "logic-420.png", "panel-1100.png", "panel-420.png", "main-1100.png", "main-420.png", "expanded-1100.png", "expanded-420.png"];
   console.log(`artifacts: ${shots.map(name => join(artifactDir, name)).join(", ")}`);
 } finally {
   if (browser) await browser.close();

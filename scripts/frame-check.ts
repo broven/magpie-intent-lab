@@ -1,9 +1,9 @@
 // Loads the plugin the way magpie's window does: page/ in an iframe sandboxed
 // to allow-scripts, served under magpie's page policy (pagePolicy in
 // internal/gui/pluginpage.go), with a stand-in bridge. Passes only when the
-// frame goes on to the service and the interface lists the groups from
-// there, with an opaque origin. Catches an inline script the policy blocks
-// and a service that refuses Origin "null".
+// frame goes on to the service, the session list scrolls inside its panel,
+// three selected sessions replay into the session-first view, and a session
+// expands to its per-turn rows.
 import { dirname, join, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -90,48 +90,46 @@ try {
   if (origin !== "null") throw new Error(`frame origin is ${origin}, expected opaque "null"`);
 
   const logicSteps = await frame.$$eval('[data-testid="logic-step"]', (nodes: any[]) => nodes.length);
-  if (logicSteps < 8) throw new Error(`decision-logic panel has ${logicSteps} steps, expected 8`);
+  if (logicSteps !== 2) throw new Error(`decision-logic panel has ${logicSteps} steps, expected 2`);
+
+  await frame.waitForSelector("#session-list .session-card", { timeout: 60_000 });
+  const listScroll = await frame.$eval("#session-list", (node: any) => ({
+    scrollHeight: node.scrollHeight, clientHeight: node.clientHeight,
+  }));
+  if (!(listScroll.scrollHeight > listScroll.clientHeight)) {
+    throw new Error(`session list does not scroll internally: ${JSON.stringify(listScroll)}`);
+  }
+
+  await frame.click('[data-testid="session-select-none"]');
+  const boxes = await frame.$$('[data-testid="session-checkbox"]');
+  if (boxes.length < 3) throw new Error(`session list has ${boxes.length} sessions, need at least 3`);
+  for (const box of boxes.slice(0, 3)) await box.check();
+  const selected = await frame.evaluate(() => state.selectedSessions.size);
+  if (selected !== 3) throw new Error(`expected 3 selected sessions, got ${selected}`);
+
+  await frame.click('[data-testid="run-button"]');
+  await frame.waitForFunction(
+    () => document.querySelectorAll('[data-testid="session-result"]').length === 3,
+    undefined,
+    { timeout: 300_000 },
+  );
+  const timelineCells = await frame.$$eval('[data-testid="turn-cell"]', (nodes: any[]) => nodes.length);
+  if (!timelineCells) throw new Error("session main view has no timeline cells");
+
+  await frame.click('[data-testid="session-result-head"]');
+  await frame.waitForSelector('[data-testid="turn-row"]', { timeout: 10_000 });
+  const turnRows = await frame.$$eval('[data-testid="turn-row"]', (nodes: any[]) => nodes.length);
+  if (!turnRows) throw new Error("expanded session has no per-turn rows");
   const headers = await frame.$$eval('[data-testid="result-table"] th', (nodes: any[]) => nodes.map(node => node.textContent));
   for (const wanted of ["当前 实际模型", "草稿 实际模型"]) {
-    if (!headers.includes(wanted)) throw new Error(`result table has no ${wanted} column: ${headers.join(" | ")}`);
+    if (!headers.includes(wanted)) throw new Error(`turn table has no ${wanted} column: ${headers.join(" | ")}`);
   }
-
-  await frame.fill('[data-testid="session-search"]', "git");
-  for (const scope of ["user", "reply", "bash"]) await frame.check(`input.scope[value="${scope}"]`);
-  let found = false;
-  for (const term of ["git", "the"]) {
-    if (term !== "git") await frame.fill('[data-testid="session-search"]', term);
-    await frame.click('[data-testid="session-search-button"]');
-    try {
-      await frame.waitForSelector(".session-card", { timeout: 30_000 });
-      found = true;
-      break;
-    } catch { /* try the next common word */ }
-  }
-  if (!found) throw new Error("session search listed no sessions");
-  const sessionCards = await frame.$$eval(".session-card", (nodes: any[]) => nodes.length);
-  if (!sessionCards) throw new Error("session search listed no session cards");
-
-  await frame.click('[data-testid="session-preview"]');
-  await frame.waitForSelector("#session-modal:not([hidden])", { timeout: 15_000 });
-  await frame.waitForSelector("#session-modal .preview-item", { timeout: 30_000 });
-  const previewText = await frame.$eval("#session-modal-body", (node: any) => node.textContent ?? "");
-  if (!previewText.trim()) throw new Error("session preview modal is empty");
-  const previewItems = await frame.$$eval('[data-testid="preview-user"], [data-testid="preview-bash"]', (nodes: any[]) => nodes.length);
-  if (!previewItems) throw new Error("session preview has no messages or bash events");
-  await page.keyboard.press("Escape");
-  await frame.waitForSelector("#session-modal", { state: "hidden", timeout: 5_000 });
-
-  await frame.click("#session-clear");
-  await frame.fill('[data-testid="limit-input"]', "5");
-  await frame.click('[data-testid="run-button"]');
-  await frame.waitForSelector('[data-testid="result-table"] tbody tr.result-row', { timeout: 240_000 });
-  await frame.click('[data-testid="result-table"] tbody tr.result-row');
+  await frame.click('[data-testid="turn-row"]');
   await frame.waitForSelector("tr.detail", { timeout: 10_000 });
   const detail = await frame.$eval("tr.detail", (node: any) => node.textContent ?? "");
-  if (!detail.includes("判定过程")) throw new Error("expanded row has no 判定过程 trace");
-  if (!detail.includes("粘性")) throw new Error("expanded row has no 粘性 trace");
-  console.log(`PASS frame went to ${frame.url()} (origin ${origin}); groups: ${options.join(", ")}; logic steps: ${logicSteps}; sessions: ${sessionCards}; trace: 判定过程; sticky: 粘性`);
+  if (!detail.includes("判定过程")) throw new Error("expanded turn has no 判定过程 trace");
+  if (!detail.includes("粘性")) throw new Error("expanded turn has no 粘性 trace");
+  console.log(`PASS frame went to ${frame.url()} (origin ${origin}); groups: ${options.join(", ")}; logic steps: ${logicSteps}; sessions: 3; list scroll: ${listScroll.scrollHeight}/${listScroll.clientHeight}; timeline: ${timelineCells}; turn rows: ${turnRows}; trace: 判定过程; sticky: 粘性`);
 } catch (err: any) {
   failed = true;
   console.error(`FAIL ${err?.message ?? err}`);

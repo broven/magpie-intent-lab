@@ -11,13 +11,12 @@ const state = {
   group: null,
   draft: null,
   result: null,
-  filterChanged: false,
-  filterIntent: "",
+  filterTiming: "",
   applyPreviewed: false,
   sessionResults: [],
   selectedSessions: new Set(),
-  sessionSearchActive: false,
   sessionQuery: { q: "", regex: false },
+  sessionTimer: null,
 };
 
 function el(tag, className, text) {
@@ -88,38 +87,18 @@ function renderLogic() {
   const wrap = $("#logic-body");
   wrap.replaceChildren();
   const logic = state.group?.logic;
-  if (!logic) {
+  if (!logic?.steps?.length) {
     wrap.append(el("p", "empty-state", "这个组没有可展示的判定逻辑。"));
     return;
   }
-  const head = el("div", "logic-group");
-  head.append(el("b", "", logic.group.id));
-  head.append(el("span", "", `分类器 ${logic.group.classifier || "—"} · 阈值 ${logic.group.threshold} · ${logic.group.ruleCount} 条规则`));
-  head.append(el("span", "", `上游 ${logic.upstream}`));
-  wrap.append(head);
   for (const step of logic.steps) {
     const card = el("div", "logic-step");
     card.dataset.testid = "logic-step";
     const title = el("div", "logic-step-head");
     title.append(el("span", "num", String(step.n)));
     title.append(el("b", "", step.title));
-    title.append(el("span", "source", step.source));
     card.append(title);
     card.append(el("p", "logic-copy", step.body));
-    const facts = el("div", "logic-facts");
-    for (const fact of step.facts) {
-      const box = el("div", "logic-fact");
-      box.append(el("span", "label", fact.label));
-      if (fact.items?.length) {
-        const list = el("span", "chips");
-        for (const item of fact.items) list.append(el("code", "", item));
-        box.append(list);
-      } else {
-        box.append(el("code", "", fact.value ?? "—"));
-      }
-      facts.append(box);
-    }
-    card.append(facts);
     wrap.append(card);
   }
 }
@@ -143,6 +122,10 @@ function ruleSummary(rule) {
 
 function sideCell(side) {
   const wrap = el("div");
+  if (side?.stopped) {
+    wrap.append(el("div", "intent", "未判（已命中即停）"));
+    return wrap;
+  }
   wrap.append(el("div", "intent", side?.intent || "(none)"));
   wrap.append(el("div", "sure", `sure ${sureText(side?.sure)}`));
   wrap.append(el("div", "model", side?.use || "—"));
@@ -173,6 +156,10 @@ function stickyLabel(why) {
 
 function memberCell(side) {
   const wrap = el("div", "member-cell");
+  if (side?.stopped) {
+    wrap.append(el("div", "model member-full", "未判（已命中即停）"));
+    return wrap;
+  }
   const member = side?.member || "";
   const from = side?.from || "";
   if (side?.switched) {
@@ -393,25 +380,83 @@ async function runBacktest(body) {
   return result;
 }
 
+function timingLabel(value) {
+  return { single: "单轮", early: "开头命中", mid: "中途命中", miss: "未命中" }[value] || value;
+}
+
+function timingBadgeClass(value) {
+  return `timing-badge ${value}`;
+}
+
 function renderSummary() {
   const summaryNode = $("#summary");
   summaryNode.replaceChildren();
   if (!state.result) return;
-  const { rows, summary, stats, cache } = state.result;
+  const { summary, stats, cache } = state.result;
+  const sessions = state.result.sessions ?? [];
+  const timing = summary.timing;
+  const turns = sessions.reduce((sum, session) => sum + session.turns, 0);
 
   const grid = el("div", "summary-grid");
-  const stat = (label, value) => {
+  const stat = (label, value, testid) => {
     const box = el("div", "stat");
+    if (testid) box.dataset.testid = testid;
     box.append(el("b", "", String(value)));
     box.append(el("span", "", label));
     grid.append(box);
   };
-  stat("样本", rows.length);
-  stat("变化", summary.changed);
-  stat("当前 intent 数", Object.keys(summary.current ?? {}).length);
-  stat("草稿 intent 数", Object.keys(summary.draft ?? {}).length);
+  stat("会话", sessions.length);
+  stat("轮次", turns);
+  stat("变化轮次", summary.changed);
+  if (timing) {
+    stat("单轮会话", timing.single, "timing-single");
+    stat("开头命中", timing.early, "timing-early");
+    stat("中途命中", timing.mid, "timing-mid");
+    stat("未命中", timing.miss, "timing-miss");
+  }
   if (cache) stat("Jev 新请求 / 缓存命中", `${cache.requests ?? 0} / ${cache.hits ?? 0}`);
   summaryNode.append(grid);
+
+  if (timing) {
+    const ratio = el("p", "timing-ratios");
+    ratio.dataset.testid = "timing-ratios";
+    ratio.textContent = `多轮 ${timing.multi} 个：开头 ${(100 * timing.ratios.early).toFixed(1)}% · 中途 ${(100 * timing.ratios.mid).toFixed(1)}% · 未命中 ${(100 * timing.ratios.miss).toFixed(1)}%（K=${timing.k}${timing.stopAfterHit ? "，草稿命中即停" : ""}）`;
+    summaryNode.append(ratio);
+
+    const title = el("h3", "", "第一次命中所在轮次");
+    title.style.fontSize = "13px";
+    title.style.margin = "14px 0 6px";
+    summaryNode.append(title);
+    const wrap = el("div", "matrix-wrap timing-histogram");
+    wrap.dataset.testid = "timing-histogram";
+    const table = el("table");
+    const thead = el("thead");
+    const head = el("tr");
+    head.append(el("th", "", "轮次"));
+    for (const bin of ["1", "2", "3", "4–5", "6–10", ">10"]) head.append(el("th", "", bin));
+    thead.append(head);
+    table.append(thead);
+    const tbody = el("tbody");
+    const row = el("tr");
+    row.append(el("th", "", "会话数"));
+    for (const bin of ["1", "2", "3", "4-5", "6-10", ">10"]) row.append(el("td", "", String(timing.histogram[bin] ?? 0)));
+    tbody.append(row);
+    table.append(tbody);
+    wrap.append(table);
+    summaryNode.append(wrap);
+
+    const midCost = el("p", "timing-mid-cost");
+    midCost.dataset.testid = "timing-mid-cost";
+    midCost.textContent = `中途命中切换代价：${timing.midCost.switches} 次切换 · 重写前缀 ${timing.midCost.estimatedTokens ? "≈" : ""}${formatTokens(timing.midCost.prefixTokens)} tokens · 中位数 ${timing.midCost.median} tokens`;
+    summaryNode.append(midCost);
+  }
+
+  if (summary.jev) {
+    const jev = el("p", "jev-stats");
+    jev.dataset.testid = "jev-stats";
+    jev.textContent = `Jev 实际请求（不含缓存）：current ${summary.jev.current.requests} · draft ${summary.jev.draft.requests}；缓存命中：current ${summary.jev.current.hits} · draft ${summary.jev.draft.hits}`;
+    summaryNode.append(jev);
+  }
 
   const sticky = summary.sticky;
   if (sticky?.current && sticky?.draft) {
@@ -470,58 +515,6 @@ function renderSummary() {
     }
     summaryNode.append(cards);
   }
-
-  const transitions = summary.transitions ?? {};
-  const froms = Object.keys(transitions).sort();
-  const tos = [...new Set([...Object.keys(summary.current ?? {}), ...Object.keys(summary.draft ?? {})])].sort();
-  if (froms.length) {
-    const title = el("h3", "", "current → draft 转移矩阵");
-    title.style.fontSize = "13px";
-    title.style.margin = "14px 0 6px";
-    summaryNode.append(title);
-    const wrap = el("div", "matrix-wrap");
-    const table = el("table");
-    const thead = el("thead");
-    const headRow = el("tr");
-    headRow.append(el("th", "", "current \\ draft"));
-    for (const to of tos) headRow.append(el("th", "", to));
-    thead.append(headRow);
-    table.append(thead);
-    const tbody = el("tbody");
-    for (const from of froms) {
-      const row = el("tr");
-      row.append(el("th", "", from));
-      for (const to of tos) row.append(el("td", "", String(transitions[from]?.[to] ?? 0)));
-      tbody.append(row);
-    }
-    table.append(tbody);
-    wrap.append(table);
-    summaryNode.append(wrap);
-  }
-
-  renderIntentFilter();
-}
-
-function renderIntentFilter() {
-  const select = $("#intent-filter");
-  const previous = state.filterIntent;
-  select.replaceChildren();
-  const all = document.createElement("option");
-  all.value = "";
-  all.textContent = "全部";
-  select.append(all);
-  const values = new Set([
-    ...Object.keys(state.result?.summary?.current ?? {}),
-    ...Object.keys(state.result?.summary?.draft ?? {}),
-  ]);
-  for (const value of [...values].sort()) {
-    const option = document.createElement("option");
-    option.value = value;
-    option.textContent = value;
-    select.append(option);
-  }
-  state.filterIntent = values.has(previous) ? previous : "";
-  select.value = state.filterIntent;
 }
 
 function traceBlock(title, side, row, testid) {
@@ -687,7 +680,7 @@ function detailRow(row) {
   const tr = el("tr", "detail");
   tr.dataset.testid = "row-detail";
   const td = document.createElement("td");
-  td.colSpan = 10;
+  td.colSpan = 11;
   const grid = el("div", "detail-grid");
 
   const full = el("div");
@@ -719,11 +712,13 @@ function renderSessionList(data) {
   const list = $("#session-list");
   list.replaceChildren();
   if (!data.sessions.length) {
-    list.append(el("p", "empty-state", "没有命中的会话。"));
+    list.append(el("p", "empty-state", "没有会话。"));
     return;
   }
+  const searching = !!state.sessionQuery.q;
   for (const session of data.sessions) {
     const card = el("div", "session-card");
+    card.dataset.sessionId = session.id;
     const head = el("div", "session-card-head");
     const check = document.createElement("label");
     check.className = "session-check";
@@ -749,76 +744,105 @@ function renderSessionList(data) {
     });
     head.append(preview);
     card.append(head);
-    card.append(el("div", "session-time", `${formatTime(session.start)} → ${formatTime(session.end)}`));
-    card.append(el("div", "session-first", session.first || "（首条消息为空）"));
-    card.append(el("div", "session-meta", `命中 ${session.hits} 次 · ${session.turns} 个 turn`));
+    card.append(el("div", "session-time", `最后一轮 ${formatTime(session.lastTurn)} · ${session.turns} 轮`));
+    card.append(el("div", "session-first", shortText(session.first, 240) || "（首条消息为空）"));
+    if (searching) card.append(el("div", "session-meta", `命中 ${session.hits} 次`));
     const snippets = el("div", "snippets");
-    for (const snippet of (session.snippets || []).slice(0, 3)) {
-      const row = el("div", "snippet");
-      row.append(el("span", "scope", snippet.scope));
-      const text = el("span", "snippet-text");
-      text.innerHTML = (snippet.lead ? "…" : "") + highlightHtml(snippet.text, state.sessionQuery.q, state.sessionQuery.regex) + (snippet.trail ? "…" : "");
-      row.append(text);
-      snippets.append(row);
+    if (searching) {
+      for (const snippet of (session.snippets || []).slice(0, 3)) {
+        const row = el("div", "snippet");
+        row.append(el("span", "scope", snippet.scope));
+        const text = el("span", "snippet-text");
+        text.innerHTML = (snippet.lead ? "…" : "") + highlightHtml(snippet.text, state.sessionQuery.q, state.sessionQuery.regex) + (snippet.trail ? "…" : "");
+        row.append(text);
+        snippets.append(row);
+      }
     }
     card.append(snippets);
     list.append(card);
   }
 }
 
-async function searchSessionList() {
+function selectedAgents() {
+  return [...document.querySelectorAll(".agent:checked")].map(node => node.value);
+}
+
+function scheduleSessionLoad() {
+  if (state.sessionTimer) clearTimeout(state.sessionTimer);
+  state.sessionTimer = setTimeout(() => {
+    state.sessionTimer = null;
+    loadSessionList();
+  }, 400);
+}
+
+async function loadSessionList() {
   const q = $("#session-search").value.trim();
   const status = $("#session-status");
-  const button = $("#session-search-button");
   status.classList.remove("warn");
-  if (!q) {
-    clearSessionSearch();
-    return;
-  }
   const scopes = sessionScopes();
-  if (!scopes.length) {
+  if (q && !scopes.length) {
     status.textContent = "至少选择一个搜索范围。";
     status.classList.add("warn");
     return;
   }
-  const params = new URLSearchParams({ q, scopes: scopes.join(","), limit: "100" });
-  if ($("#session-regex").checked) params.set("regex", "1");
+  const agents = selectedAgents();
+  if (!agents.length) {
+    state.sessionResults = [];
+    state.selectedSessions.clear();
+    renderSessionList({ sessions: [] });
+    status.textContent = "至少选择一个 agent。";
+    status.classList.add("warn");
+    return;
+  }
+  const limit = Number($("#session-limit").value);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+    status.textContent = "最近 N 个会话必须是 1…1000 的整数。";
+    status.classList.add("warn");
+    return;
+  }
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (q) {
+    params.set("q", q);
+    params.set("scopes", scopes.join(","));
+    if ($("#session-regex").checked) params.set("regex", "1");
+  }
+  // All three agents is the warm-up's default read; leave it off the query
+  // so the first list does not start a second full transcript parse.
+  if (agents.length && agents.length < 3) params.set("agents", agents.join(","));
   if ($("#from").value) params.set("from", $("#from").value);
   if ($("#to").value) params.set("to", $("#to").value);
-  button.disabled = true;
-  status.textContent = "搜索中…";
+  status.textContent = q ? "搜索中…" : "读取最近会话…";
   try {
     const response = await api("/api/sessions?" + params.toString());
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
     state.sessionResults = data.sessions ?? [];
     state.selectedSessions = new Set(state.sessionResults.map(session => session.id));
-    state.sessionSearchActive = true;
     state.sessionQuery = { q, regex: $("#session-regex").checked };
     renderSessionList(data);
-    status.textContent = `命中 ${state.sessionResults.length} 个会话 · 搜索耗时 ${data.durationMs} ms`;
+    status.textContent = q
+      ? `命中 ${state.sessionResults.length} 个会话 · 搜索耗时 ${data.durationMs} ms`
+      : `最近 ${state.sessionResults.length} 个会话 · 读取耗时 ${data.durationMs} ms`;
   } catch (error) {
-    state.sessionSearchActive = false;
     state.sessionResults = [];
     state.selectedSessions.clear();
     $("#session-list").replaceChildren();
-    status.textContent = "搜索失败：" + (error?.message || String(error));
+    status.textContent = "读取失败：" + (error?.message || String(error));
     status.classList.add("warn");
-  } finally {
-    button.disabled = false;
   }
 }
 
 function clearSessionSearch() {
-  state.sessionResults = [];
-  state.selectedSessions.clear();
-  state.sessionSearchActive = false;
-  state.sessionQuery = { q: "", regex: false };
   $("#session-search").value = "";
-  $("#session-list").replaceChildren();
-  const status = $("#session-status");
-  status.classList.remove("warn");
-  status.textContent = "未搜索：回测使用最近 N 个 turn。";
+  state.sessionQuery = { q: "", regex: false };
+  loadSessionList();
+}
+
+function selectAllSessions(checked) {
+  state.selectedSessions = checked
+    ? new Set(state.sessionResults.map(session => session.id))
+    : new Set();
+  renderSessionList({ sessions: state.sessionResults });
 }
 
 function closeSessionModal() {
@@ -881,8 +905,6 @@ async function openSession(id, sampleId) {
   $("#session-modal-title").textContent = "会话预览";
   const params = new URLSearchParams({ id });
   if (sampleId) params.set("sample", sampleId);
-  if ($("#from").value) params.set("from", $("#from").value);
-  if ($("#to").value) params.set("to", $("#to").value);
   try {
     const response = await api("/api/session?" + params.toString());
     const data = await response.json();
@@ -894,70 +916,137 @@ async function openSession(id, sampleId) {
   }
 }
 
+function turnRow(row) {
+  const tr = el("tr", "result-row turn-row");
+  tr.dataset.testid = "turn-row";
+  const cell = (label, content, className = "") => {
+    const td = el("td", className);
+    td.dataset.label = label;
+    if (content instanceof Node) td.append(content);
+    else td.textContent = content;
+    return td;
+  };
+  tr.append(cell("轮次", String(row.turn)));
+  tr.append(cell("时间", formatTime(row.time)));
+  tr.append(cell("agent", row.agent));
+  tr.append(cell("folder", row.folder || "—"));
+  const messageCell = el("div", "msg-cell");
+  messageCell.append(el("span", "msg-text", shortText(row.fullText || row.text, 120)));
+  tr.append(cell("消息摘要", messageCell, "msg"));
+  tr.append(cell("当前 intent · sure · 规则 use", sideCell(row.current)));
+  tr.append(cell("当前 实际模型", memberCell(row.current), row.current?.switched ? "actual switched" : "actual"));
+  tr.append(cell("草稿 intent · sure · 规则 use", sideCell(row.draft)));
+  tr.append(cell("草稿 实际模型", memberCell(row.draft), row.draft?.switched ? "actual switched" : "actual"));
+  const changed = el("span", row.changed ? "badge" : "badge none", row.changed ? "变化" : "—");
+  tr.append(cell("变化", changed));
+  const unknown = el("span", row.unknownConds?.length ? "badge warn" : "badge none", row.unknownConds?.length ? `${row.unknownConds.length} 个` : "—");
+  tr.append(cell("unknown", unknown));
+  tr.addEventListener("click", () => {
+    const next = tr.nextElementSibling;
+    if (next?.classList.contains("detail")) next.remove();
+    else tr.after(detailRow(row));
+  });
+  return tr;
+}
+
+function turnTable(rows) {
+  const wrap = el("div", "table-wrap turn-table");
+  const table = el("table");
+  table.dataset.testid = "result-table";
+  const thead = el("thead");
+  const head = el("tr");
+  for (const value of ["轮次", "时间", "agent", "folder", "消息摘要", "当前 intent · sure · 规则 use", "当前 实际模型", "草稿 intent · sure · 规则 use", "草稿 实际模型", "变化", "unknown"]) {
+    head.append(el("th", "", value));
+  }
+  thead.append(head);
+  table.append(thead);
+  const tbody = el("tbody");
+  for (const row of rows) tbody.append(turnRow(row));
+  table.append(tbody);
+  wrap.append(table);
+  return wrap;
+}
+
+function timelineFor(session) {
+  const timeline = el("div", "session-timeline");
+  timeline.dataset.testid = "session-timeline";
+  for (const row of session.rows) {
+    const kind = row.draft.stopped ? "stopped" : row.draft.rule > 0 ? "hit" : "miss";
+    const kindLabel = { hit: "命中", miss: "未命中", stopped: "未判" }[kind];
+    const cell = el("span", `turn-cell ${kind}` + (row.draft.switched ? " switch" : ""));
+    cell.dataset.testid = "turn-cell";
+    cell.dataset.turn = String(row.turn);
+    cell.dataset.kind = kind;
+    cell.title = `第 ${row.turn} 轮 · ${kindLabel}${row.draft.switched ? ` · 切换 ${shortMember(row.draft.from)} → ${shortMember(row.draft.member)}` : ""}`;
+    cell.textContent = String(row.turn);
+    timeline.append(cell);
+  }
+  return timeline;
+}
+
 function renderResults() {
-  const body = $("#result-body");
+  const body = $("#session-results");
   body.replaceChildren();
   const empty = $("#result-empty");
   if (!state.result) {
     setHidden(empty, false);
     empty.textContent = "还没有回测结果。";
+    $("#result-count").textContent = "";
     return;
   }
-  const rows = state.result.rows.filter(row => {
-    if (state.filterChanged && !row.changed) return false;
-    if (state.filterIntent && row.current?.intent !== state.filterIntent && row.draft?.intent !== state.filterIntent) return false;
-    return true;
-  });
-  if (!rows.length) {
+  const sessions = (state.result.sessions ?? []).filter(session => !state.filterTiming || session.class === state.filterTiming);
+  $("#result-count").textContent = `${sessions.length} 个会话`;
+  if (!sessions.length) {
     setHidden(empty, false);
-    empty.textContent = "没有符合条件的结果。";
+    empty.textContent = "没有符合分类条件的会话。";
     return;
   }
   setHidden(empty, true);
-  for (const row of rows) {
-    const tr = el("tr", "result-row");
-    const cell = (label, content, className = "") => {
-      const td = el("td", className);
-      td.dataset.label = label;
-      if (content instanceof Node) td.append(content);
-      else td.textContent = content;
-      return td;
-    };
-    tr.append(cell("时间", formatTime(row.time)));
-    tr.append(cell("agent", row.agent));
-    tr.append(cell("folder", row.folder || "—"));
-    const messageCell = el("div", "msg-cell");
-    messageCell.append(el("span", "msg-text", shortText(row.fullText || row.text, 120)));
-    if (row.sessionId) {
-      const preview = el("button", "secondary tiny", "预览会话");
-      preview.type = "button";
-      preview.dataset.testid = "preview-result";
-      preview.addEventListener("click", event => {
-        event.stopPropagation();
-        openSession(row.sessionId, row.id);
-      });
-      messageCell.append(preview);
+  for (const session of sessions) {
+    const card = el("article", "session-result");
+    card.dataset.testid = "session-result";
+    card.dataset.class = session.class;
+    const head = el("div", "session-result-head");
+    head.dataset.testid = "session-result-head";
+    const badge = el("span", timingBadgeClass(session.class), timingLabel(session.class));
+    head.append(badge);
+    head.append(el("b", "session-result-agent", `${session.agent} · ${session.folder || "—"}`));
+    head.append(el("span", "muted", `${session.turns} 轮`));
+    head.append(el("span", "muted", session.firstHit === null ? "未命中" : `第一次命中：第 ${session.firstHit} 轮`));
+    if (session.switched) {
+      const mark = el("span", "switch-mark");
+      mark.dataset.testid = "session-switch";
+      mark.append(el("span", "from", shortMember(session.from)));
+      mark.append(el("span", "arrow", "→"));
+      mark.append(el("span", "to", shortMember(session.to)));
+      mark.title = `${memberName(session.from)} → ${memberName(session.to)}`;
+      head.append(mark);
+      if (session.prefixTokens) head.append(el("span", "switch-cost", `${formatTokens(session.prefixTokens)} 前缀 tokens`));
     }
-    tr.append(cell("消息摘要", messageCell, "msg"));
-    tr.append(cell("当前 intent · sure · 规则 use", sideCell(row.current)));
-    tr.append(cell("当前 实际模型", memberCell(row.current), row.current?.switched ? "actual switched" : "actual"));
-    tr.append(cell("草稿 intent · sure · 规则 use", sideCell(row.draft)));
-    tr.append(cell("草稿 实际模型", memberCell(row.draft), row.draft?.switched ? "actual switched" : "actual"));
-    const changed = el("span", row.changed ? "badge" : "badge none", row.changed ? "变化" : "—");
-    tr.append(cell("变化", changed));
-    const unknown = row.unknownConds?.length
-      ? el("span", "badge warn", `${row.unknownConds.length} 个`)
-      : el("span", "badge none", "—");
-    tr.append(cell("unknown", unknown));
-    tr.addEventListener("click", () => {
-      const next = tr.nextElementSibling;
-      if (next?.classList.contains("detail")) {
-        next.remove();
-      } else {
-        tr.after(detailRow(row));
-      }
+    const preview = el("button", "secondary tiny", "预览");
+    preview.type = "button";
+    preview.dataset.testid = "session-preview-result";
+    preview.addEventListener("click", event => {
+      event.stopPropagation();
+      const hit = session.firstHit === null ? null : session.rows.find(row => row.turn === session.firstHit);
+      openSession(session.id, hit?.id);
     });
-    body.append(tr);
+    head.append(preview);
+    card.append(head);
+    card.append(el("div", "session-first", shortText(session.first, 240) || "（首条消息为空）"));
+    card.append(timelineFor(session));
+
+    const turns = el("div", "session-turns");
+    turns.hidden = true;
+    turns.dataset.testid = "session-turns";
+    turns.append(turnTable(session.rows));
+    card.append(turns);
+    head.addEventListener("click", event => {
+      if (event.target.closest("button")) return;
+      turns.hidden = !turns.hidden;
+      card.classList.toggle("open", !turns.hidden);
+    });
+    body.append(card);
   }
 }
 
@@ -1059,14 +1148,28 @@ function renderApplyResult(data) {
   }
 }
 
-$("#session-search-button").addEventListener("click", () => searchSessionList());
+$("#session-search-button").addEventListener("click", () => loadSessionList());
+$("#session-search").addEventListener("input", () => scheduleSessionLoad());
 $("#session-search").addEventListener("keydown", event => {
   if (event.key === "Enter") {
     event.preventDefault();
-    searchSessionList();
+    loadSessionList();
   }
 });
 $("#session-clear").addEventListener("click", () => clearSessionSearch());
+$("#session-select-all").addEventListener("click", () => selectAllSessions(true));
+$("#session-select-none").addEventListener("click", () => selectAllSessions(false));
+for (const id of ["#from", "#to", "#session-limit"]) {
+  $(id).addEventListener("input", () => scheduleSessionLoad());
+  $(id).addEventListener("change", () => scheduleSessionLoad());
+}
+for (const node of document.querySelectorAll(".agent")) node.addEventListener("change", () => scheduleSessionLoad());
+$("#session-regex").addEventListener("change", () => { if ($("#session-search").value.trim()) scheduleSessionLoad(); });
+for (const node of document.querySelectorAll(".scope")) node.addEventListener("change", () => { if ($("#session-search").value.trim()) scheduleSessionLoad(); });
+$("#timing-filter").addEventListener("change", event => {
+  state.filterTiming = event.target.value;
+  renderResults();
+});
 $("#session-modal").addEventListener("click", event => {
   if (event.target?.dataset?.close) closeSessionModal();
 });
@@ -1090,49 +1193,29 @@ $("#add-rule").addEventListener("click", () => {
   invalidateApply();
 });
 
-$("#only-changed").addEventListener("change", event => {
-  state.filterChanged = event.target.checked;
-  renderResults();
-});
-
-$("#intent-filter").addEventListener("change", event => {
-  state.filterIntent = event.target.value;
-  renderResults();
-});
-
 $("#run-button").addEventListener("click", async () => {
   if (!state.group || !state.group.supported || !state.draft) return;
-  const agents = [...document.querySelectorAll(".agent:checked")].map(node => node.value);
   const errorNode = $("#run-error");
   setHidden(errorNode, true);
-  if (!agents.length) {
-    errorNode.textContent = "至少选择一个 agent。";
+  const selected = [...state.selectedSessions];
+  if (!selected.length) {
+    errorNode.textContent = "至少勾选一个会话。";
     setHidden(errorNode, false);
     return;
   }
-  const limit = Number($("#limit-input").value);
-  if (!Number.isInteger(limit) || limit < 1 || limit > 10000) {
-    errorNode.textContent = "最近 N 必须是 1…10000 的整数。";
+  const k = Number($("#k-input").value);
+  if (!Number.isInteger(k) || k < 1 || k > 10000) {
+    errorNode.textContent = "前 K 轮必须是 1…10000 的整数。";
     setHidden(errorNode, false);
     return;
   }
   const body = {
     group: state.group.id,
     draft: { rules: state.draft.rules, intentSure: state.draft.intentSure },
-    agents,
-    limit,
+    sessions: selected,
+    k,
+    stopAfterHit: $("#stop-after-hit").checked,
   };
-  if ($("#from").value) body.from = $("#from").value;
-  if ($("#to").value) body.to = $("#to").value;
-  if (state.sessionSearchActive) {
-    const selected = [...state.selectedSessions];
-    if (!selected.length) {
-      errorNode.textContent = "至少勾选一个会话。";
-      setHidden(errorNode, false);
-      return;
-    }
-    body.sessions = selected;
-  }
   $("#run-button").disabled = true;
   setHidden($("#progress-wrap"), false);
   setProgress(0, 0, "history");
@@ -1143,7 +1226,8 @@ $("#run-button").addEventListener("click", async () => {
     renderResults();
     setHidden($("#summary-panel"), false);
     setHidden($("#results-panel"), false);
-    $("#progress-text").textContent = `完成：${result.rows.length} 条，${result.summary.changed} 条变化`;
+    const turns = result.sessions.reduce((sum, session) => sum + session.turns, 0);
+    $("#progress-text").textContent = `完成：${result.sessions.length} 个会话，${turns} 轮，${result.summary.changed} 轮变化`;
     $("#progress-fill").style.width = "100%";
   } catch (error) {
     errorNode.textContent = error?.message || String(error);
@@ -1201,4 +1285,8 @@ loadGroups().catch(error => {
   node.textContent = "读取路由组失败：" + (error?.message || String(error));
   setHidden(node, false);
   $("#run-button").disabled = true;
+});
+loadSessionList().catch(error => {
+  $("#session-status").textContent = "读取会话失败：" + (error?.message || String(error));
+  $("#session-status").classList.add("warn");
 });

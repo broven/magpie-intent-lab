@@ -10,7 +10,7 @@
 <div class="wrap">
   <header class="top">
     <h1>Intent Lab <span>意图回测</span></h1>
-    <p class="sub">用 magpie 路由过的历史会话，对比当前规则和草稿的 intent 分类与模型选择。写回只改 intent、use 和增删规则。</p>
+    <p class="sub">先选会话，再把每个会话从第 1 轮完整跑到最后一轮，看它在哪一轮命中、会不会切换模型。</p>
   </header>
 
   <section class="panel" id="group-panel">
@@ -42,21 +42,30 @@
     </div>
   </section>
 
-
   <section class="panel" id="logic-panel" data-testid="logic-panel">
     <details open>
-      <summary data-testid="logic-toggle"><span class="summary-title">判定逻辑</span> <span class="muted">当前组实际参数 · 上游源码位置</span></summary>
+      <summary data-testid="logic-toggle"><span class="summary-title">判定逻辑</span> <span class="muted">何时判 · 带上一轮</span></summary>
       <div id="logic-body" class="logic-body"><p class="empty-state">正在读取…</p></div>
     </details>
   </section>
 
-
   <section class="panel" id="session-panel" data-testid="session-panel">
-    <h2>会话过滤 <span class="muted">搜索只用来选会话；选中的会话按日期/agent 回测全部 turn</span></h2>
+    <h2>选会话 <span class="muted">按会话完整回测；日期范围按每个会话的最后一轮筛选</span></h2>
+    <div class="filter-row">
+      <label>从 <input type="date" id="from"></label>
+      <label>到 <input type="date" id="to"></label>
+      <fieldset>
+        <legend>agent</legend>
+        <label><input type="checkbox" class="agent" value="claude" checked> claude</label>
+        <label><input type="checkbox" class="agent" value="codex" checked> codex</label>
+        <label><input type="checkbox" class="agent" value="pi" checked> pi</label>
+      </fieldset>
+      <label>最近 <input type="number" id="session-limit" data-testid="session-limit" value="30" min="1" max="1000"> 个会话</label>
+    </div>
     <div class="filter-row">
       <input type="text" id="session-search" data-testid="session-search" placeholder="搜索会话内容…" autocomplete="off">
       <label><input type="checkbox" id="session-regex" data-testid="session-regex"> 正则</label>
-      <button id="session-search-button" data-testid="session-search-button" type="button">搜索会话</button>
+      <button id="session-search-button" data-testid="session-search-button" type="button">搜索</button>
       <button id="session-clear" class="secondary" type="button">清除</button>
     </div>
     <div class="filter-row" id="session-scopes" data-testid="session-scopes">
@@ -68,22 +77,16 @@
         <label><input type="checkbox" class="scope" value="bash"> bash 命令 + 结果</label>
       </fieldset>
     </div>
-    <p id="session-status" class="muted">未搜索：回测使用最近 N 个 turn。</p>
-    <div id="session-list" data-testid="session-list"></div>
-  </section>
+    <div class="filter-row session-select-row">
+      <button id="session-select-all" data-testid="session-select-all" type="button" class="secondary">全选</button>
+      <button id="session-select-none" data-testid="session-select-none" type="button" class="secondary">全不选</button>
+      <span id="session-status" class="muted">正在读取会话…</span>
+    </div>
+    <div id="session-list" data-testid="session-list" class="session-list"></div>
 
-  <section class="panel" id="samples-panel">
-    <h2>样本条件</h2>
-    <div class="filter-row">
-      <label>从 <input type="date" id="from"></label>
-      <label>到 <input type="date" id="to"></label>
-      <fieldset>
-        <legend>agent</legend>
-        <label><input type="checkbox" class="agent" value="claude" checked> claude</label>
-        <label><input type="checkbox" class="agent" value="codex" checked> codex</label>
-        <label><input type="checkbox" class="agent" value="pi" checked> pi</label>
-      </fieldset>
-      <label>最近 <input type="number" id="limit-input" data-testid="limit-input" value="200" min="1" max="10000"> 个 turn</label>
+    <div class="filter-row run-row">
+      <label>开头命中 ≤ 前 <input type="number" id="k-input" data-testid="k-input" value="3" min="1" max="10000"> 轮</label>
+      <label><input type="checkbox" id="stop-after-hit" data-testid="stop-after-hit"> 草稿命中即停</label>
       <button id="run-button" data-testid="run-button" type="button">回测</button>
     </div>
     <div id="progress-wrap" class="progress-wrap" hidden>
@@ -94,36 +97,24 @@
   </section>
 
   <section class="panel" id="summary-panel" hidden>
-    <h2>汇总</h2>
+    <h2>汇总 <span class="muted">只看草稿一侧</span></h2>
     <div id="summary" data-testid="summary"></div>
   </section>
 
   <section class="panel" id="results-panel" hidden>
-    <h2>结果</h2>
+    <h2>会话结果 <span class="muted">点会话展开逐轮结果；点预览定位到第一次命中</span></h2>
     <div class="filter-row">
-      <label><input type="checkbox" id="only-changed" data-testid="only-changed"> 只看变化</label>
-      <label>intent <select id="intent-filter" data-testid="intent-filter"><option value="">全部</option></select></label>
+      <label>分类 <select id="timing-filter" data-testid="timing-filter">
+        <option value="">全部</option>
+        <option value="early">开头命中</option>
+        <option value="mid">中途命中</option>
+        <option value="miss">未命中</option>
+        <option value="single">单轮</option>
+      </select></label>
+      <span id="result-count" class="muted"></span>
     </div>
-    <div class="table-wrap">
-      <table id="result-table" data-testid="result-table">
-        <thead>
-          <tr>
-            <th style="width:10%">时间</th>
-            <th style="width:6%">agent</th>
-            <th style="width:9%">folder</th>
-            <th style="width:14%">消息摘要</th>
-            <th style="width:12%">当前 intent · sure · 规则 use</th>
-            <th style="width:13%">当前 实际模型</th>
-            <th style="width:12%">草稿 intent · sure · 规则 use</th>
-            <th style="width:13%">草稿 实际模型</th>
-            <th style="width:6%">变化</th>
-            <th style="width:5%">unknown</th>
-          </tr>
-        </thead>
-        <tbody id="result-body"></tbody>
-      </table>
-      <div id="result-empty" class="empty-state">还没有回测结果。</div>
-    </div>
+    <div id="session-results" data-testid="session-results"></div>
+    <div id="result-empty" class="empty-state">还没有回测结果。</div>
   </section>
 
   <section class="panel" id="apply-panel" hidden>

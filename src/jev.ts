@@ -23,6 +23,7 @@ export const levelWork = [
 export interface Verdict { intent: string; said: string; topic: boolean; sure: number; effort: string; score: number }
 export interface JevAnswer { model?: string; answers?: Record<string, { choice?: string; score?: number; noul?: number; confidence?: number; probabilities?: Record<string, unknown> }>; [key: string]: unknown }
 export interface Levelling { levels: boolean; work: Record<string, string> | null; cached?: boolean }
+export interface JevMeter { requests: number; hits: number }
 export const emptyVerdict = (): Verdict => ({ intent: "", said: "", topic: false, sure: 0, effort: "", score: 0 });
 
 export function Confidence(ps: Record<string, unknown> = {}): number {
@@ -183,18 +184,19 @@ export class JevClient {
     this.file = join(options.dir ?? process.env.INTENT_LAB_DIR ?? join(homedir(), ".config/magpie/intent-lab"), "cache.jsonl");
     this.url = "http://" + (options.addr ?? process.env.MAGPIE_ADDR ?? "127.0.0.1:3425") + "/v1/systemone";
   }
-  async systemOne(body: unknown, meta?: { cached?: boolean }): Promise<JevAnswer> {
+  async systemOne(body: unknown, meta?: { cached?: boolean }, meter?: JevMeter): Promise<JevAnswer> {
     const bytes = requestBytes(body);
     const key = createHash("sha256").update(bytes).digest("hex");
     const disk = diskCache(this.file);
     await disk.loaded;
     const cached = disk.answers.get(key);
-    if (cached) { this.stats.hits++; if (meta) meta.cached = true; return cached; }
+    if (cached) { this.stats.hits++; if (meter) meter.hits++; if (meta) meta.cached = true; return cached; }
     const flightKey = this.file + "\0" + this.url + "\0" + key;
     const flight = pending.get(flightKey);
-    if (flight) { this.stats.hits++; if (meta) meta.cached = true; return flight; }
+    if (flight) { this.stats.hits++; if (meter) meter.hits++; if (meta) meta.cached = true; return flight; }
     const call = slot(async () => {
       this.stats.requests++;
+      if (meter) meter.requests++;
       const res = await fetch(this.url, { method: "POST", headers: { "content-type": "application/json" }, body: bytes, signal: AbortSignal.timeout(120_000) });
       if (!res.ok) throw new Error(`Jev HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
       const answer = await res.json() as JevAnswer;
@@ -213,7 +215,7 @@ export class JevClient {
     pending.set(flightKey, call);
     try { return await call; } finally { pending.delete(flightKey); }
   }
-  async jevLevelled(model: string, intents: string[], meta?: { cached?: boolean }): Promise<Levelling> {
+  async jevLevelled(model: string, intents: string[], meta?: { cached?: boolean }, meter?: JevMeter): Promise<Levelling> {
     const key = model + "\0" + intents.join("\0").toLowerCase();
     const old = this.levellings.get(key);
     if (old) {
@@ -224,7 +226,7 @@ export class JevClient {
     const call = (async () => {
       const questions: Record<string, unknown> = { levels: { type: "noul", instructions: "Are these `kinds` levels of one scale that every request to a coding assistant is at, such as how hard, how big or how urgent it is — rather than topics or tasks that a request may be none of?" } };
       intents.forEach((_, i) => { questions[`work${i}`] = { type: "score", instructions: `Taking \`kinds\` as levels of one scale for requests to a coding assistant, how much work is a request at the level \`kinds[${i}]\`?`, criteria: levelWork }; });
-      const answer = await this.systemOne({ model, state: { kinds: intents }, questions }, meta);
+      const answer = await this.systemOne({ model, state: { kinds: intents }, questions }, meta, meter);
       const noul = answer.answers?.levels?.noul;
       if (typeof noul !== "number") throw new Error("not a System One answer");
       const levels = noul >= levelSure;
@@ -234,14 +236,14 @@ export class JevClient {
     this.levellings.set(key, call);
     try { return await call; } catch (err) { this.levellings.delete(key); throw err; }
   }
-  async askJev(model: string, intents: string[], prev: Before, text: string) {
+  async askJev(model: string, intents: string[], prev: Before, text: string, meter?: JevMeter) {
     const probe: { cached?: boolean } = {};
     const levelling: Levelling = intents.length > 1
-      ? await this.jevLevelled(model, intents, probe)
+      ? await this.jevLevelled(model, intents, probe, meter)
       : { levels: false, work: null };
     const body = jevBody(model, intents, levelling.work, prev, false, text);
     const meta: { cached?: boolean } = {};
-    const raw = await this.systemOne(body, meta);
+    const raw = await this.systemOne(body, meta, meter);
     return {
       verdict: readJev(raw, intents, levelling.levels, prev), raw, body, levels: levelling.levels,
       cached: !!meta.cached,
