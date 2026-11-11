@@ -1,0 +1,55 @@
+{
+  "model": "typesafe/jev-latest",
+  "intents": [
+    "写代码",
+    "问问题"
+  ],
+  "prev": {},
+  "scores": [
+    0,
+    3
+  ],
+  "rules": [],
+  "query": {},
+  "messages": [
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": "开始"
+        }
+      ]
+    },
+    {
+      "Role": "assistant",
+      "Parts": [
+        {
+          "Kind": "tool_call",
+          "Text": "ignored"
+        }
+      ]
+    },
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "tool_result",
+          "Text": "output"
+        }
+      ]
+    },
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": "这是图片说明"
+        },
+        {
+          "Kind": "image"
+        }
+      ]
+    }
+  ]
+}

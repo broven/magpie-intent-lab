@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { assistantSaid, cutMiddle, trimSpace, userSaidDetailed } from "./textprep";
+import { assistantSaid, cutMiddle, trimSpace, turnStates, userSaidDetailed } from "./textprep";
 import { readHistory, readTranscript, sessionId, sessionPath, type Filters, type Sample } from "./history";
 import { bashEvents, type BashEvent } from "./transcripts/bash";
 import type { Agent, Transcript } from "./transcripts/common";
@@ -246,6 +246,7 @@ export async function sessionPreview(
   if (!agent) throw new Error("未知会话");
   const selected = range(options);
   const t = await readTranscript(path, agent);
+  const states = turnStates(t.messages);
   const items: PreviewItem[] = [];
   for (let i = 0; i < t.messages.length; i++) {
     const m = t.messages[i];
@@ -256,7 +257,7 @@ export async function sessionPreview(
       const inRange = at >= selected.from && at <= selected.to;
       items.push({
         kind: "user", time: m.time, text, message: i,
-        sampleId: inRange ? sampleIdFor(agent, path, m.id) : undefined,
+        sampleId: inRange && states[i].newTurn ? sampleIdFor(agent, path, m.id) : undefined,
       });
     } else if (m.Role === "assistant") {
       const text = assistantSaid(m);

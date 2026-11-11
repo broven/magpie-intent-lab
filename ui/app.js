@@ -149,6 +149,51 @@ function sideCell(side) {
   return wrap;
 }
 
+function formatTokens(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "—";
+  const sign = n < 0 ? "-" : "", abs = Math.abs(n);
+  if (abs >= 1_000_000) return sign + (abs / 1_000_000).toFixed(1).replace(/\.0$/, "") + "m";
+  if (abs >= 1_000) return sign + (abs / 1_000).toFixed(1).replace(/\.0$/, "") + "k";
+  return String(n);
+}
+
+function memberName(value) {
+  return value || "组默认路由（成员未知）";
+}
+
+function shortMember(value) {
+  if (!value) return "未知";
+  return value.split("/")[0] || value;
+}
+
+function stickyLabel(why) {
+  return { rule: "规则命中", kept: "粘住上一轮", initial: "初始成员", unknown: "成员未知" }[why] || "未知";
+}
+
+function memberCell(side) {
+  const wrap = el("div", "member-cell");
+  const member = side?.member || "";
+  const from = side?.from || "";
+  if (side?.switched) {
+    const mark = el("div", "switch-mark");
+    mark.dataset.testid = "switch-mark";
+    mark.append(el("span", "from", shortMember(from)));
+    mark.append(el("span", "arrow", "→"));
+    mark.append(el("span", "to", shortMember(member)));
+    mark.title = `${memberName(from)} → ${memberName(member)}`;
+    wrap.append(mark);
+    wrap.append(el("div", "model member-full", `${memberName(from)} → ${memberName(member)}`));
+    if (side.prefixTokens) {
+      wrap.append(el("div", "switch-cost", `${side.prefixEstimated ? "≈" : ""}${formatTokens(side.prefixTokens)} 前缀 tokens`));
+    }
+  } else {
+    wrap.append(el("div", "model member-full", memberName(member)));
+  }
+  wrap.append(el("div", "sticky-why", stickyLabel(side?.stickyWhy)));
+  return wrap;
+}
+
 function renderGroupMeta() {
   const group = state.group;
   const meta = $("#group-meta");
@@ -368,6 +413,40 @@ function renderSummary() {
   if (cache) stat("Jev 新请求 / 缓存命中", `${cache.requests ?? 0} / ${cache.hits ?? 0}`);
   summaryNode.append(grid);
 
+  const sticky = summary.sticky;
+  if (sticky?.current && sticky?.draft) {
+    const title = el("h3", "", "会话粘性");
+    title.style.fontSize = "13px";
+    title.style.margin = "14px 0 6px";
+    summaryNode.append(title);
+    const wrap = el("div", "matrix-wrap sticky-summary");
+    const table = el("table");
+    const thead = el("thead");
+    const head = el("tr");
+    for (const value of ["指标", "current", "draft", "draft − current"]) head.append(el("th", "", value));
+    thead.append(head);
+    table.append(thead);
+    const tbody = el("tbody");
+    const signed = value => value > 0 ? `+${value}` : String(value);
+    const tokens = counts => `${counts.estimatedTokens ? "≈" : ""}${formatTokens(counts.prefixTokens)}`;
+    const estimated = counts => `${counts.estimatedTokens ? "≈" : ""}${formatTokens(counts.estimatedTokens)}${counts.estimatedSwitches ? `（${counts.estimatedSwitches} 次）` : ""}`;
+    const line = (label, current, draft, difference) => {
+      const row = el("tr");
+      row.append(el("th", "", label));
+      row.append(el("td", "", String(current)));
+      row.append(el("td", "", String(draft)));
+      row.append(el("td", "", String(difference)));
+      tbody.append(row);
+    };
+    line("切换次数", sticky.current.switches, sticky.draft.switches, signed(sticky.diff.switches));
+    line("发生切换的会话", sticky.current.sessions, sticky.draft.sessions, signed(sticky.diff.sessions));
+    line("重写前缀 tokens", tokens(sticky.current), tokens(sticky.draft), `${sticky.diff.estimatedTokens ? "≈" : ""}${formatTokens(sticky.diff.prefixTokens)}`);
+    line("其中估算", estimated(sticky.current), estimated(sticky.draft), `${sticky.diff.estimatedTokens ? "≈" : ""}${formatTokens(sticky.diff.estimatedTokens)}`);
+    table.append(tbody);
+    wrap.append(table);
+    summaryNode.append(wrap);
+  }
+
   if (stats?.agents) {
     const cards = el("div", "agent-stats");
     for (const agent of ["claude", "codex", "pi"]) {
@@ -566,6 +645,30 @@ function traceBlock(title, side, row, testid) {
   walk.append(chosen);
   box.append(walk);
 
+  const sticky = trace.sticky;
+  if (sticky) {
+    const section = el("div", "trace-section sticky-trace");
+    section.dataset.testid = testid + "-sticky";
+    section.append(el("h4", "", "粘性"));
+    const flow = el("div", "sticky-flow");
+    flow.append(el("span", "", memberName(sticky.from)));
+    flow.append(el("span", "arrow", "→"));
+    flow.append(el("span", "", sticky.rule ? `命中规则 ${sticky.ruleUse}` : "未命中规则"));
+    flow.append(el("span", "arrow", "→"));
+    flow.append(el("span", "to", memberName(sticky.member)));
+    section.append(flow);
+    const facts = el("div", "trace-facts");
+    facts.append(kv("上一轮成员", memberName(sticky.from)));
+    facts.append(kv("是否命中规则", sticky.rule ? `是（${sticky.ruleUse}）` : "否"));
+    facts.append(kv("实际成员", memberName(sticky.member)));
+    facts.append(kv("原因", stickyLabel(sticky.why)));
+    if (sticky.switched) {
+      facts.append(kv("切换前缀", `${sticky.prefixEstimated ? "≈" : ""}${formatTokens(sticky.prefixTokens)} tokens`));
+    }
+    section.append(facts);
+    box.append(section);
+  }
+
   const rawBox = (label, value, id) => {
     const details = document.createElement("details");
     details.dataset.testid = id;
@@ -584,7 +687,7 @@ function detailRow(row) {
   const tr = el("tr", "detail");
   tr.dataset.testid = "row-detail";
   const td = document.createElement("td");
-  td.colSpan = 8;
+  td.colSpan = 10;
   const grid = el("div", "detail-grid");
 
   const full = el("div");
@@ -836,8 +939,10 @@ function renderResults() {
       messageCell.append(preview);
     }
     tr.append(cell("消息摘要", messageCell, "msg"));
-    tr.append(cell("当前 intent · sure · 模型", sideCell(row.current)));
-    tr.append(cell("草稿 intent · sure · 模型", sideCell(row.draft)));
+    tr.append(cell("当前 intent · sure · 规则 use", sideCell(row.current)));
+    tr.append(cell("当前 实际模型", memberCell(row.current), row.current?.switched ? "actual switched" : "actual"));
+    tr.append(cell("草稿 intent · sure · 规则 use", sideCell(row.draft)));
+    tr.append(cell("草稿 实际模型", memberCell(row.draft), row.draft?.switched ? "actual switched" : "actual"));
     const changed = el("span", row.changed ? "badge" : "badge none", row.changed ? "变化" : "—");
     tr.append(cell("变化", changed));
     const unknown = row.unknownConds?.length

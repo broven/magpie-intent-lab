@@ -1,0 +1,42 @@
+{
+  "model": "typesafe/jev-latest",
+  "intents": [
+    "写代码",
+    "问问题"
+  ],
+  "prev": {},
+  "scores": [
+    0,
+    3
+  ],
+  "rules": [],
+  "query": {},
+  "messages": [
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": "开始"
+        }
+      ]
+    },
+    {
+      "Role": "assistant",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": "回复"
+        }
+      ]
+    },
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "file"
+        }
+      ]
+    }
+  ]
+}

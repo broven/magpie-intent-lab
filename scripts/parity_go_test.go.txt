@@ -36,6 +36,7 @@ func TestIntentLabParity(t *testing.T) {
   said := []string{}
   for _, m := range f.Messages { said = append(said, userSaid(m)) }
   index, text := lastSaid(req, len(req.Messages))
+  turn, within := turnIn(req)
   user, reply := turnBefore(req)
   var body any
   if err := json.Unmarshal(jevBody(f.Model, f.Intents, f.Work, f.Prev, f.Effort, userText(req)), &body); err != nil { t.Fatal(err) }
@@ -46,6 +47,7 @@ func TestIntentLabParity(t *testing.T) {
   result := map[string]any{
    "userSaid": said,
    "lastSaid": map[string]any{"index": index, "text": text},
+   "turnIn": map[string]any{"turn": turn, "within": within},
    "cutMiddle": cutMiddle(text, 3000, 1000),
    "turnBefore": map[string]string{"user": user, "reply": reply},
    "jevBody": body,

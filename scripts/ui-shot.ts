@@ -151,7 +151,74 @@ try {
   await page.locator("tr.detail").screenshot({ path: join(artifactDir, "trace-420.png") });
   console.log("PASS trace-420.png", JSON.stringify(trace420));
 
-  const shots = ["ui-1100.png", "ui-420.png", "ui-1100-dark.png", "ui-420-dark.png", "logic-1100.png", "logic-420.png", "sessions-1100.png", "sessions-420.png", "preview-1100.png", "preview-420.png", "trace-1100.png", "trace-420.png"];
+  // A second run restricted to one known session, with a draft that hits the
+  // rule, shows the actual-model columns and a switch marker. Restricting the
+  // session keeps the screenshot and the classifier calls small.
+  await page.setViewportSize({ width: 1100, height: 900 });
+  // The earlier screenshots left a search active; clear it so the next
+  // waitForSelector cannot match its stale cards.
+  await page.click("#session-clear");
+  await page.fill('[data-testid="session-search"]', "cheaperinference");
+  await page.check('input.scope[value="user"]');
+  await page.click('[data-testid="session-search-button"]');
+  await page.waitForFunction(
+    () => (document.querySelector("#session-status")?.textContent || "").includes("命中"),
+    undefined,
+    { timeout: 60_000 },
+  );
+  await page.waitForSelector(".session-card", { timeout: 60_000 });
+  await page.evaluate(() => {
+    // Match the session's own first message, not the whole card: snippets
+    // quote any user text, including this script's own phrase, and selecting
+    // one of those would replay the wrong session.
+    const cards = [...document.querySelectorAll(".session-card")];
+    const target = cards.find(card => (card.querySelector(".session-first")?.textContent || "").includes("我想做llm reseller"));
+    if (!target) throw new Error("switch screenshot session not found");
+    for (const card of cards) {
+      if (card === target) continue;
+      const box = card.querySelector('[data-testid="session-checkbox"]');
+      if (box?.checked) {
+        box.checked = false;
+        box.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }
+    const box = target.querySelector('[data-testid="session-checkbox"]');
+    if (!box?.checked) {
+      box.checked = true;
+      box.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    for (const input of document.querySelectorAll('#draft-rules input[type="text"]')) {
+      input.value = "写代码或改代码";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  });
+  const selected = await page.evaluate(() => state.selectedSessions.size);
+  if (selected !== 1) throw new Error(`expected one selected session for the switch screenshot, got ${selected}`);
+  const rowsBefore = await page.locator('[data-testid="result-table"] tbody tr.result-row').count();
+  await page.click('[data-testid="run-button"]');
+  // The first run's rows stay in the table until the second result arrives.
+  await page.waitForFunction(
+    previous => {
+      const count = document.querySelectorAll('[data-testid="result-table"] tbody tr.result-row').length;
+      return count > 0 && count !== previous;
+    },
+    rowsBefore,
+    { timeout: 300_000 },
+  );
+  await page.waitForFunction(
+    () => document.querySelectorAll('[data-testid="switch-mark"]').length > 0,
+    undefined,
+    { timeout: 30_000 },
+  );
+  const switchMarks = await page.locator('[data-testid="switch-mark"]').count();
+  await page.locator("#results-panel").screenshot({ path: join(artifactDir, "results-1100.png") });
+  console.log(`PASS results-1100.png switches=${switchMarks}`);
+  await page.setViewportSize({ width: 420, height: 900 });
+  const results420 = await noHorizontalScroll(page, 420);
+  await page.locator("#results-panel").screenshot({ path: join(artifactDir, "results-420.png") });
+  console.log("PASS results-420.png", JSON.stringify(results420));
+
+  const shots = ["ui-1100.png", "ui-420.png", "ui-1100-dark.png", "ui-420-dark.png", "logic-1100.png", "logic-420.png", "sessions-1100.png", "sessions-420.png", "preview-1100.png", "preview-420.png", "trace-1100.png", "trace-420.png", "results-1100.png", "results-420.png"];
   console.log(`artifacts: ${shots.map(name => join(artifactDir, name)).join(", ")}`);
 } finally {
   if (browser) await browser.close();

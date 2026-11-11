@@ -70,6 +70,7 @@ export function parts(content: unknown): Part[] {
     if (!b || typeof b !== "object") return [];
     if (["text", "input_text", "output_text"].includes(b.type) && typeof b.text === "string") return [{ Kind: "text", Text: b.text }];
     if (["image", "input_image", "image_url"].includes(b.type)) return [{ Kind: "image" }];
+    if (["file", "document", "input_file"].includes(b.type)) return [{ Kind: "file" }];
     if (["tool_use", "toolCall", "function_call"].includes(b.type)) {
       return [{ Kind: "tool_call", Call: { id: b.id ?? b.call_id, name: b.name, input: b.input ?? b.arguments } }];
     }

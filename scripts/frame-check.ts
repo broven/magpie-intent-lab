@@ -90,7 +90,11 @@ try {
   if (origin !== "null") throw new Error(`frame origin is ${origin}, expected opaque "null"`);
 
   const logicSteps = await frame.$$eval('[data-testid="logic-step"]', (nodes: any[]) => nodes.length);
-  if (logicSteps < 7) throw new Error(`decision-logic panel has ${logicSteps} steps, expected 7`);
+  if (logicSteps < 8) throw new Error(`decision-logic panel has ${logicSteps} steps, expected 8`);
+  const headers = await frame.$$eval('[data-testid="result-table"] th', (nodes: any[]) => nodes.map(node => node.textContent));
+  for (const wanted of ["当前 实际模型", "草稿 实际模型"]) {
+    if (!headers.includes(wanted)) throw new Error(`result table has no ${wanted} column: ${headers.join(" | ")}`);
+  }
 
   await frame.fill('[data-testid="session-search"]', "git");
   for (const scope of ["user", "reply", "bash"]) await frame.check(`input.scope[value="${scope}"]`);
@@ -126,7 +130,8 @@ try {
   await frame.waitForSelector("tr.detail", { timeout: 10_000 });
   const detail = await frame.$eval("tr.detail", (node: any) => node.textContent ?? "");
   if (!detail.includes("判定过程")) throw new Error("expanded row has no 判定过程 trace");
-  console.log(`PASS frame went to ${frame.url()} (origin ${origin}); groups: ${options.join(", ")}; logic steps: ${logicSteps}; sessions: ${sessionCards}; trace: 判定过程`);
+  if (!detail.includes("粘性")) throw new Error("expanded row has no 粘性 trace");
+  console.log(`PASS frame went to ${frame.url()} (origin ${origin}); groups: ${options.join(", ")}; logic steps: ${logicSteps}; sessions: ${sessionCards}; trace: 判定过程; sticky: 粘性`);
 } catch (err: any) {
   failed = true;
   console.error(`FAIL ${err?.message ?? err}`);

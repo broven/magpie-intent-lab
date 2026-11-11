@@ -19,7 +19,7 @@ export interface GroupLogic {
   upstream: string;
   group: {
     id: string; classifier: string; intentSure: number | null; threshold: number;
-    intents: string[]; none: string; members: string[]; ruleCount: number;
+    intents: string[]; none: string; members: string[]; ruleCount: number; affinity: string;
   };
   constants: {
     injected: string[]; reminderTag: string; myRequestMarker: string;
@@ -54,6 +54,7 @@ export function logicFor(group: Group): GroupLogic {
       none: noIntent,
       members: group.members ?? [],
       ruleCount: group.rules?.length ?? 0,
+      affinity: group.affinity ?? "",
     },
     constants: {
       injected, reminderTag, myRequestMarker, textCut, prevCut,
@@ -131,13 +132,29 @@ export function logicFor(group: Group): GroupLogic {
       },
       {
         n: 7,
+        title: "粘性",
+        source: "internal/gateway/gateway.go:3187、3205；internal/gateway/affinity.go:564-744；internal/gateway/rules.go:758-809",
+        body: "新一轮命中带 use 的规则时，ruleOver 把规则的成员排到最前，盖过会话粘性，实际成员就是规则的 use。没命中规则时只剩 affine 的粘性：session/strict 保持上一轮的实际成员；turn/off 不留；未设置（auto）取决于供应商缓存是否命中，记为成员未知。",
+        facts: [
+          { label: "本组 affinity", value: group.affinity || "（未设置：auto/cache）" },
+          { label: "命中带 use 的规则", value: "实际成员 = 规则 use，可切换" },
+          { label: "未命中 + session/strict", value: "保持上一轮成员，不切回" },
+          { label: "未命中 + turn/off", value: "组默认路由（成员未知）" },
+          { label: "未命中 + 未设置", value: "依赖缓存，成员未知" },
+          { label: "未模拟", value: "失败转移、rest、账号限额、粘性超时" },
+        ],
+      },
+      {
+        n: 8,
         title: "与真实路由的差异",
         source: "src/upstream.json",
-        body: "输入来自 transcript，而不是请求体；移植参照的上游源码版本可能和本机 magpie 不同；非 intent 条件会出现 unknown；Jev 模型版本会变，答案里的 model 会显示出来。",
+        body: "输入来自 transcript，而不是请求体；移植参照的上游源码版本可能和本机 magpie 不同；非 intent 条件会出现 unknown；Jev 模型版本会变，答案里的 model 会显示出来。粘性模拟不包含失败转移、rest、账号限额和粘性超时；切换前缀优先取 routing 的 prompt.tokens/tokens，缺失时按 transcript 字符数 / 4 估算并标 ≈。",
         facts: [
           { label: "移植参照上游 commit", value: upstream.commit },
           { label: "输入", value: "transcript" },
           { label: "Jev 模型版本", value: "以答案里的 model 为准" },
+          { label: "粘性未模拟", value: "失败转移、rest、账号限额、粘性超时" },
+          { label: "切换前缀缺失时", value: "transcript 前缀字符数 / 4，标 ≈" },
         ],
       },
     ],

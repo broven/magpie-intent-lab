@@ -19,6 +19,7 @@ export interface RuleRequest {
 }
 export interface Group {
   id: string; name?: string; members: string[]; classifier?: string; intentSure?: number | null;
+  affinity?: string; routing?: string;
   rules: Rule[]; [key: string]: unknown;
 }
 export interface UnknownCond { rule: number; condition: string }

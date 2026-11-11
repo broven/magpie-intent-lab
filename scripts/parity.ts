@@ -1,7 +1,7 @@
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assistantSaid, cutMiddle, lastSaid, turnBefore, userSaid, userText } from "../src/textprep";
+import { assistantSaid, cutMiddle, lastSaid, turnBefore, turnIn, userSaid, userText } from "../src/textprep";
 import { intentOf, jevBody, levelsOf, readJev } from "../src/jev";
 import { Intents, MatchRule, Matches } from "../src/rules";
 
@@ -21,7 +21,7 @@ for (const name of (await readdir(join(root, "fixtures"))).filter(n => n.endsWit
   const q = Object.fromEntries(Object.entries(f.query ?? {}).map(([k, v]) => [k[0].toLowerCase() + k.slice(1), v]));
   q.time = q.at;
   const result: any = {
-    userSaid: messages.map(userSaid), lastSaid: last,
+    userSaid: messages.map(userSaid), lastSaid: last, turnIn: turnIn(messages),
     cutMiddle: cutMiddle(last.text, 3000, 1000), turnBefore: turnBefore(messages),
     jevBody: jevBody(f.model, f.intents, f.work ?? null, f.prev ?? {}, !!f.effort, userText(messages)),
     levelsOf: levelsOf(f.intents, f.scores ?? []),

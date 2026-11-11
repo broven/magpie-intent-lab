@@ -4,6 +4,8 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promi
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readHistory, readTranscript } from "../src/history";
+import { turnIn, userSaid } from "../src/textprep";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const artifactDir = join(root, "artifacts");
@@ -227,6 +229,101 @@ try {
     }
   }
   check("11 per-row trace", { rows: restricted.result.rows.length, sides: ["current", "draft"] });
+  // 12: rerun the turnIn probe over every sample the plugin produces. A
+  // sample must be the message that opened a new turn (turnIn within false);
+  // the messages turnIn keeps inside the previous turn are not samples.
+  const all = await readHistory({ limit: 10_000, all: true });
+  let withinSamples = 0;
+  for (const sample of all.samples) {
+    const transcript = await readTranscript(sample.session, sample.agent);
+    const message = transcript.messages[sample.message];
+    assert.ok(message && message.Role === "user", `sample ${sample.id} must point at a user message`);
+    assert.equal(userSaid(message), sample.fullText, `sample ${sample.id} text must match its transcript message`);
+    const state = turnIn(transcript.messages.slice(0, sample.message + 1));
+    if (state.within) withinSamples++;
+  }
+  assert.equal(withinSamples, 0, "no plugin sample may be within a turn");
+  assert.ok(all.stats.skippedWithin > 0, "D1 must exclude the within-turn messages it used to sample");
+  artifact.d1 = {
+    samples: all.samples.length,
+    excludedWithin: all.stats.skippedWithin,
+    withinSamples,
+    turns: all.stats.turns,
+  };
+  console.log(`D1 samples=${all.samples.length} excludedWithin=${all.stats.skippedWithin} withinSamples=${withinSamples}`);
+  check("12 D1 samples open a new turn; within-turn messages excluded", {
+    samples: all.samples.length, excludedWithin: all.stats.skippedWithin,
+  });
+  // 13: session stickiness. The edited draft makes some turns hit the rule;
+  // claude-opus is affinity=session, so every later non-hit turn in that
+  // session must stay on the previous actual member (stickyWhy kept), and
+  // only a change of actual member counts as a switch.
+  assert.equal(group.affinity, "session", "this check is written for the real claude-opus affinity");
+  // Pick a real multi-turn session and change the rule's use to the group's
+  // other member. The same turns then hit on both sides, while the session
+  // moves member in current (wokey) but not in draft (jmds).
+  const switchSearch = await json(`/api/sessions?q=${encodeURIComponent("llm reseller")}&scopes=first&limit=20`);
+  const switchSession = switchSearch.sessions.find((session: any) => session.first.includes("我想做llm reseller") && session.turns > 1);
+  assert.ok(switchSession, "a multi-turn session for the stickiness check must exist");
+  const currentUse = group.rules.find((rule: any) => rule.use)?.use;
+  const otherMember = group.members.find((member: string) => member !== currentUse);
+  assert.ok(currentUse && otherMember, "claude-opus must have two members to switch between");
+  const stickyDraft = structuredClone(draft);
+  for (const rule of stickyDraft.rules) rule.use = otherMember;
+  const stickyRun = await run({ group: group.id, draft: stickyDraft, sessions: [switchSession.id] });
+  const stickyRows = stickyRun.result.rows;
+  const bySession = new Map<string, any[]>();
+  for (const row of stickyRows) {
+    const list = bySession.get(row.session);
+    if (list) list.push(row); else bySession.set(row.session, [row]);
+  }
+  const sideCounts: Record<string, number> = { current: 0, draft: 0 };
+  let hitRows = 0, keptAfterHit = 0, switchedRows = 0;
+  for (const side of ["current", "draft"] as const) {
+    let switches = 0, prefixTokens = 0;
+    for (const rows of bySession.values()) {
+      let previous = rows[0].initialMember || "";
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i], result = row[side];
+        assert.ok(["rule", "kept", "initial", "unknown"].includes(result.stickyWhy), `row ${row.id} ${side} stickyWhy`);
+        assert.equal(typeof result.member, "string", `row ${row.id} ${side} member`);
+        assert.equal(typeof result.from, "string", `row ${row.id} ${side} from`);
+        assert.equal(result.from, i === 0 ? (row.initialMember || "") : previous, `row ${row.id} ${side} from must be the previous member`);
+        if (result.rule > 0) {
+          hitRows++;
+          assert.equal(result.stickyWhy, "rule", `row ${row.id} ${side} rule hit must say rule`);
+          assert.equal(result.member, result.use, `row ${row.id} ${side} rule hit must use the rule member`);
+        } else if (i > 0 && previous && rows.slice(0, i).some(prior => prior[side].rule > 0)) {
+          keptAfterHit++;
+          assert.equal(result.stickyWhy, "kept", `row ${row.id} ${side} after a hit must stay by affinity`);
+          assert.equal(result.member, previous, `row ${row.id} ${side} after a hit must keep the previous member`);
+        }
+        if (result.switched) {
+          switchedRows++;
+          assert.notEqual(result.member, result.from, `row ${row.id} ${side} switched must change member`);
+          assert.ok(result.prefixTokens > 0, `row ${row.id} ${side} switch must carry prefix tokens`);
+        }
+        if (result.from && result.member) {
+          assert.equal(result.switched, result.from !== result.member, `row ${row.id} ${side} switched must mean a member change`);
+        }
+        if (result.switched) { switches++; prefixTokens += result.prefixTokens; }
+        previous = result.member;
+      }
+    }
+    assert.equal(stickyRun.result.summary.sticky[side].switches, switches, `${side} summary switch count must sum rows`);
+    assert.equal(stickyRun.result.summary.sticky[side].prefixTokens, prefixTokens, `${side} summary prefix tokens must sum switched rows`);
+    const switchedSessions = new Set(stickyRows.filter(row => row[side].switched).map(row => row.session)).size;
+    assert.equal(stickyRun.result.summary.sticky[side].sessions, switchedSessions, `${side} summary switched session count`);
+    sideCounts[side] = switches;
+  }
+  assert.ok(hitRows > 0, "the draft must hit some turns");
+  assert.ok(keptAfterHit > 0, "a hit must be followed by a kept non-hit turn");
+  assert.ok(switchedRows > 0, "at least one row must switch members");
+  artifact.sticky = { rows: stickyRows.length, sideCounts, hitRows, keptAfterHit, switchedRows, summary: stickyRun.result.summary.sticky };
+  console.log(`D2 rows=${stickyRows.length} hits=${hitRows} keptAfterHit=${keptAfterHit} switched=${switchedRows} currentSwitches=${sideCounts.current} draftSwitches=${sideCounts.draft}`);
+  check("13 session stickiness: kept after hit, switches only on member change, summary sums", {
+    rows: stickyRows.length, hitRows, keptAfterHit, switchedRows, sideCounts,
+  });
   artifact.status = "PASS";
 } catch (error: any) {
   artifact.status = "FAIL";

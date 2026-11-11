@@ -5,7 +5,7 @@ import { createInterface } from "node:readline";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { createHash } from "node:crypto";
-import { cutMiddle, prevCut, textCut, trimSpace, userSaidDetailed } from "./textprep";
+import { cutMiddle, prevCut, textCut, trimSpace, turnStates, userSaidDetailed, type Message } from "./textprep";
 import { folderKey, type RuleRequest } from "./rules";
 import { readClaude } from "./transcripts/claude";
 import { readCodex } from "./transcripts/codex";
@@ -22,21 +22,31 @@ export interface Sample {
   text: string; fullText: string; prev: { user: string; reply: string };
   prep: SamplePrep;
   features: RuleRequest; transcript: string; message: number; routing?: { id: number; time: string; group?: string };
+  initialMembers: Record<string, string>;
+  prefixTokens: number; prefixEstimated: boolean;
 }
 export interface Filters {
   agents?: string | string[]; from?: string; to?: string; limit?: number;
   all?: boolean; sessions?: string[];
 }
+interface RouteTry {
+  id?: string; model?: string; served?: string; status?: number; done?: boolean;
+}
 interface Route {
   id: number; agent: Agent; session?: string; folder?: string; time: string;
-  sub?: string; subagentId?: string; kind?: string; group?: { id?: string };
+  sub?: string; subagentId?: string; kind?: string;
+  group?: { id?: string; affinity?: string; members?: string[]; routing?: string };
   rule?: { tokens?: number; images?: boolean; compact?: boolean; effort?: string; folder?: string };
+  model?: string; provider?: string; served?: string; tries?: RouteTry[];
+  prompt?: { tokens?: number }; tokens?: number;
 }
 interface AgentStats {
   routingRecords: number; linkedRecords: number; transcripts: number; hitRate: number; turns: number; ambiguous: number; unmatchedTurns: number;
+  skippedWithin: number;
 }
 export interface HistoryStats {
   routingRecords: number; linkedRecords: number; transcripts: number; turns: number;
+  skippedWithin: number;
   malformedRouting: number; malformedTranscript: number; agents: Record<Agent, AgentStats>;
 }
 export interface HistoryResult { samples: Sample[]; stats: HistoryStats }
@@ -104,9 +114,59 @@ async function readRouting(dir: string): Promise<{ routes: Route[]; malformed: n
   }
   return { routes: [...rows.values()].sort((a, b) => Date.parse(a.time) - Date.parse(b.time)), malformed };
 }
+// The routing log's session key, as the transcript files use it: a Claude
+// subagent has its own file, and Codex names its rollout by thread id.
+function routeSessionKey(route: Route): string {
+  if (route.agent === "claude") return route.subagentId || route.sub || route.session || "";
+  if (route.agent === "codex") return route.session || "";
+  return "";
+}
+function transcriptSessionKey(t: Transcript): string {
+  return t.agent === "claude" || t.agent === "codex" ? t.session : "";
+}
+// The account and model that actually served a routing row, as
+// provider/model. A try's id names the account or key; a "#" or "@" suffix
+// is one of its keys or accounts, not another member.
+function routeMember(route: Route): string {
+  const tries = (route.tries ?? []).filter((t): t is RouteTry => !!t);
+  const served = typeof route.served === "string" ? route.served : "";
+  const matching = tries.filter(t => !served || t.served === served || t.model === served);
+  const pick = [...matching].reverse().find(t => t.served || t.status === 200)
+    ?? [...tries].reverse().find(t => t.served || t.status === 200)
+    ?? tries.at(-1);
+  const model = pick?.served || pick?.model || served || "";
+  const provider = pick?.id
+    ? String(pick.id).split(/[@#]/)[0]
+    : typeof route.provider === "string" ? route.provider : "";
+  if (provider && model) return `${provider}/${model}`;
+  const top = typeof route.model === "string" ? route.model : "";
+  if (top.includes("/") && !top.startsWith("group/") && (!model || top.endsWith("/" + model))) return top;
+  const member = route.group?.members?.find(m => m === model || m.endsWith("/" + model));
+  return member || model;
+}
+function routeTokenCount(route: Route | undefined): number | null {
+  const prompt = route?.prompt?.tokens;
+  if (typeof prompt === "number" && Number.isFinite(prompt)) return prompt;
+  const tokens = route?.tokens;
+  return typeof tokens === "number" && Number.isFinite(tokens) ? tokens : null;
+}
+// The proxy for a turn's prefix when no routing row has prompt tokens. It
+// counts every part the agent wrote into the transcript, not only prose.
+function messageChars(m: Message): number {
+  let chars = 0;
+  for (const p of m.Parts) {
+    if (p.Text) chars += Array.from(p.Text).length;
+    if (p.Call) {
+      if (typeof p.Call.input === "string") chars += Array.from(p.Call.input).length;
+      else if (p.Call.input !== undefined) chars += JSON.stringify(p.Call.input).length;
+      if (p.Call.output) chars += Array.from(p.Call.output).length;
+    }
+  }
+  return chars;
+}
 function emptyStats(): HistoryStats {
-  const agents = Object.fromEntries(agentNames.map(a => [a, { routingRecords: 0, linkedRecords: 0, transcripts: 0, hitRate: 0, turns: 0, ambiguous: 0, unmatchedTurns: 0 }])) as Record<Agent, AgentStats>;
-  return { routingRecords: 0, linkedRecords: 0, transcripts: 0, turns: 0, malformedRouting: 0, malformedTranscript: 0, agents };
+  const agents = Object.fromEntries(agentNames.map(a => [a, { routingRecords: 0, linkedRecords: 0, transcripts: 0, hitRate: 0, turns: 0, ambiguous: 0, unmatchedTurns: 0, skippedWithin: 0 }])) as Record<Agent, AgentStats>;
+  return { routingRecords: 0, linkedRecords: 0, transcripts: 0, turns: 0, skippedWithin: 0, malformedRouting: 0, malformedTranscript: 0, agents };
 }
 export async function readHistory(filters: Filters = {}, home = homedir()): Promise<HistoryResult> {
   const selected = range(filters), stats = emptyStats();
@@ -114,6 +174,18 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
   const routing = await readRouting(join(home, ".config/magpie/routing"));
   stats.malformedRouting = routing.malformed;
   const routes = routing.routes.filter(r => selected.agents.has(r.agent) && Date.parse(r.time) >= selected.from && Date.parse(r.time) <= selected.to);
+  // A session's first answer and a turn's prompt size can lie just outside
+  // the selected date range. Keep an index of all in-agent routing rows by
+  // transcript key; only in-range rows feed the sample association above.
+  const routeIndex = new Map<string, Route[]>();
+  for (const route of routing.routes) {
+    if (!selected.agents.has(route.agent)) continue;
+    const key = routeSessionKey(route);
+    if (!key) continue;
+    const id = route.agent + "\0" + key;
+    const list = routeIndex.get(id);
+    if (list) list.push(route); else routeIndex.set(id, [route]);
+  }
   const keep = (file: string) => !wantedPaths || wantedPaths.has(file);
   const files = await Promise.all([
     selected.agents.has("claude") ? filesUnder(join(home, ".claude/projects")) : [],
@@ -165,10 +237,23 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
   for (const { t, routes: attached } of linked.values()) {
     const s = stats.agents[t.agent]; s.transcripts++; stats.transcripts++; stats.malformedTranscript += t.malformed;
     attached.sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
-    const turns: { sample: Sample; at: number }[] = [];
-    let previousUser = "", reply = "", lastAssistant = "";
+    const sessionKey = transcriptSessionKey(t);
+    const sessionRoutes = ((sessionKey ? routeIndex.get(t.agent + "\0" + sessionKey) : undefined) ?? attached)
+      .slice().sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
+    const initialMembers: Record<string, string> = {};
+    for (const route of sessionRoutes) {
+      const group = route.group?.id ?? "";
+      if (group in initialMembers) continue;
+      const member = routeMember(route);
+      if (member) initialMembers[group] = member;
+    }
+    const turns: { sample: Sample; at: number; prefixChars: number }[] = [];
+    const skipped: number[] = [];
+    const states = turnStates(t.messages);
+    let previousUser = "", lastAssistant = "", prefixChars = 0;
     for (let i = 0; i < t.messages.length; i++) {
       const m = t.messages[i];
+      prefixChars += messageChars(m);
       if (m.Role === "assistant") {
         const text = m.Parts.filter(p => p.Kind === "text").map(p => trimSpace(p.Text ?? "")).filter(Boolean).join("\n");
         if (text) lastAssistant = text;
@@ -178,7 +263,16 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
       const said = userSaidDetailed(m);
       const text = said.text;
       if (!text) continue;
-      reply = lastAssistant;
+      const reply = lastAssistant;
+      if (!states[i].newTurn) {
+        // magpie's turnIn keeps this user message inside the previous turn;
+        // it is not a sample, but it is still the last thing the user said
+        // and so becomes the previous turn's context for the next sample.
+        skipped.push(Date.parse(m.time));
+        previousUser = text;
+        lastAssistant = "";
+        continue;
+      }
       const runes = Array.from(reply);
       const beforeChars = Array.from(text).length;
       const cut = cutMiddle(text, textCut.head, textCut.tail);
@@ -200,9 +294,21 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
         },
         features: { agent: t.agent, folder: m.cwd || t.cwd, time: m.time, message: text },
         transcript: t.path, message: i,
+        initialMembers,
+        prefixTokens: 0, prefixEstimated: true,
       };
-      turns.push({ sample, at: Date.parse(m.time) });
+      turns.push({ sample, at: Date.parse(m.time), prefixChars });
       previousUser = text; lastAssistant = "";
+    }
+    for (const { sample, at, prefixChars: chars } of turns) {
+      const route = sessionRoutes.find(r => Date.parse(r.time) >= at);
+      const tokens = routeTokenCount(route);
+      sample.prefixTokens = tokens ?? Math.max(1, Math.ceil(chars / 4));
+      sample.prefixEstimated = tokens === null;
+    }
+    for (const at of skipped) {
+      if (at < selected.from || at > selected.to) continue;
+      s.skippedWithin++; stats.skippedWithin++;
     }
     // Attach each routing row only to the last user turn already present at its
     // timestamp. The first rule decision of that turn owns its request features.

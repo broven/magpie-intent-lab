@@ -21,6 +21,11 @@ export interface TraceJevAnswer {
   probabilities: Record<string, number>; sure: number; topic: boolean; raw: unknown;
 }
 export interface TraceLevelProbe { levels: boolean; work: Record<string, string> | null; cached: boolean }
+export type StickyWhy = "rule" | "kept" | "initial" | "unknown";
+export interface TraceSticky {
+  from: string; rule: boolean; ruleUse: string; member: string; switched: boolean;
+  why: StickyWhy; prefixTokens: number; prefixEstimated: boolean;
+}
 export interface Trace {
   stripped: TraceStripped;
   cut: TraceCut;
@@ -32,9 +37,12 @@ export interface Trace {
   cached: boolean;
   ruleWalk: TraceRule[];
   chosen: { n: number; use: string };
+  sticky?: TraceSticky;
 }
 export interface SideResult {
   intent: string; said: string; sure: number; rule: number; use: string;
+  member: string; switched: boolean; from: string;
+  prefixTokens: number; prefixEstimated: boolean; stickyWhy: StickyWhy;
   trace: Trace;
 }
 export interface UnknownCond { side: "current" | "draft"; rule: number; condition: string }
@@ -42,12 +50,18 @@ export interface Row {
   id: string; agent: string; session: string; sessionId: string; folder: string; time: string;
   text: string; fullText: string;
   prev: { user: string; reply: string };
+  initialMember: string; prefixTokens: number; prefixEstimated: boolean;
   current: SideResult; draft: SideResult;
   changed: boolean; unknownConds: UnknownCond[];
+}
+export interface StickyCounts {
+  switches: number; sessions: number; prefixTokens: number;
+  estimatedTokens: number; estimatedSwitches: number;
 }
 export interface Summary {
   current: Record<string, number>; draft: Record<string, number>;
   transitions: Record<string, Record<string, number>>; changed: number;
+  sticky: { current: StickyCounts; draft: StickyCounts; diff: StickyCounts };
 }
 export interface RunResult { rows: Row[]; summary: Summary }
 
@@ -148,6 +162,8 @@ async function side(jev: JevClient, model: string, state: Side, sample: Sample):
     sure: verdict.sure,
     rule: rule < 0 ? 0 : rule + 1,
     use: rule < 0 ? "" : state.rules[rule].use,
+    member: "", switched: false, from: "",
+    prefixTokens: 0, prefixEstimated: false, stickyWhy: "unknown",
     trace,
   };
   // A named level is still one of this turn's intents, as upstream carries
@@ -157,11 +173,80 @@ async function side(jev: JevClient, model: string, state: Side, sample: Sample):
   return result;
 }
 
+// session and strict keep the conversation on whoever answered it last;
+// turn and off do not. The empty mode (auto) is left unknown: affine() keeps
+// it only when the vendor's cache holds (affinity.go:704-723), which a
+// transcript cannot tell us. Failover, rests, caps and the stick timeout are
+// not simulated either.
+function stickyMode(affinity: string | undefined): boolean {
+  return affinity === "session" || affinity === "strict";
+}
+
+function simulateSticky(group: Group, rows: Row[], sideKey: "current" | "draft"): StickyCounts {
+  const counts: StickyCounts = { switches: 0, sessions: 0, prefixTokens: 0, estimatedTokens: 0, estimatedSwitches: 0 };
+  const sessions = new Map<string, Row[]>();
+  for (const row of rows) {
+    const list = sessions.get(row.session);
+    if (list) list.push(row); else sessions.set(row.session, [row]);
+  }
+  for (const list of sessions.values()) {
+    let previous = list[0]?.initialMember ?? "";
+    let sessionSwitched = false;
+    for (let i = 0; i < list.length; i++) {
+      const row = list[i], side = row[sideKey];
+      const ruleUse = side.rule > 0 ? side.use : "";
+      const from = i === 0 ? (row.initialMember || "") : previous;
+      let member = "", why: StickyWhy;
+      if (ruleUse) {
+        // ruleOver puts the rule's member first over whoever answered last.
+        member = ruleUse;
+        why = "rule";
+      } else if (i === 0) {
+        member = row.initialMember || "";
+        why = member ? "initial" : "unknown";
+      } else if (stickyMode(group.affinity) && previous) {
+        member = previous;
+        why = "kept";
+      } else {
+        member = "";
+        why = "unknown";
+      }
+      const switched = !!from && !!member && from !== member;
+      const prefixTokens = row.prefixTokens ?? 0;
+      side.member = member;
+      side.switched = switched;
+      side.from = from;
+      side.prefixTokens = prefixTokens;
+      side.prefixEstimated = !!row.prefixEstimated;
+      side.stickyWhy = why;
+      side.trace.sticky = {
+        from, rule: !!ruleUse, ruleUse, member, switched, why,
+        prefixTokens, prefixEstimated: !!row.prefixEstimated,
+      };
+      if (switched) {
+        counts.switches++;
+        if (!sessionSwitched) { counts.sessions++; sessionSwitched = true; }
+        counts.prefixTokens += prefixTokens;
+        if (row.prefixEstimated) {
+          counts.estimatedTokens += prefixTokens;
+          counts.estimatedSwitches++;
+        }
+      }
+      previous = member;
+    }
+  }
+  return counts;
+}
+
 export async function replay(jev: JevClient, group: Group, current: Group, draft: Group, samples: Sample[], progress?: (done: number, total: number) => void): Promise<RunResult> {
   const currentState: Side = { prev: new Map(), rules: current.rules, intentSure: current.intentSure };
   const draftState: Side = { prev: new Map(), rules: draft.rules, intentSure: draft.intentSure };
   const rows: Row[] = [];
-  const summary: Summary = { current: {}, draft: {}, transitions: {}, changed: 0 };
+  const zeroSticky = (): StickyCounts => ({ switches: 0, sessions: 0, prefixTokens: 0, estimatedTokens: 0, estimatedSwitches: 0 });
+  const summary: Summary = {
+    current: {}, draft: {}, transitions: {}, changed: 0,
+    sticky: { current: zeroSticky(), draft: zeroSticky(), diff: zeroSticky() },
+  };
   let done = 0;
   // A session is replayed in its own order; sessions may run side by side.
   const sessions = new Map<string, Sample[]>();
@@ -188,6 +273,8 @@ export async function replay(jev: JevClient, group: Group, current: Group, draft
           id: sample.id, agent: sample.agent, session: sample.session, sessionId: sessionId(sample.session),
           folder: sample.folder, time: sample.time,
           text: sample.text, fullText: sample.fullText, prev: sample.prev,
+          initialMember: sample.initialMembers?.[group.id] ?? "",
+          prefixTokens: sample.prefixTokens, prefixEstimated: sample.prefixEstimated,
           current: a, draft: b,
           changed: a.intent !== b.intent || a.use !== b.use || a.rule !== b.rule,
           unknownConds: unknown,
@@ -206,5 +293,15 @@ export async function replay(jev: JevClient, group: Group, current: Group, draft
   });
   await Promise.all(workers);
   rows.sort((a, b) => a.time.localeCompare(b.time) || a.id.localeCompare(b.id));
+  summary.sticky.current = simulateSticky(group, rows, "current");
+  summary.sticky.draft = simulateSticky(group, rows, "draft");
+  const diff = (a: StickyCounts, b: StickyCounts): StickyCounts => ({
+    switches: b.switches - a.switches,
+    sessions: b.sessions - a.sessions,
+    prefixTokens: b.prefixTokens - a.prefixTokens,
+    estimatedTokens: b.estimatedTokens - a.estimatedTokens,
+    estimatedSwitches: b.estimatedSwitches - a.estimatedSwitches,
+  });
+  summary.sticky.diff = diff(summary.sticky.current, summary.sticky.draft);
   return { rows, summary };
 }

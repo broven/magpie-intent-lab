@@ -69,6 +69,60 @@ export function userSaidDetailed(m: Message): WordsDetail {
 export function userSaid(m: Message): string {
   return userSaidDetailed(m).text;
 }
+// Ported from gateway/prompt.go:771. A message says something only through
+// a text part that survives the injection filters above.
+export function saysAnything(m: Message): boolean {
+  return m.Parts.some(p => p.Kind === "text" && userWords(p.Text ?? "") !== "");
+}
+// Ported from gateway/claude_subscription.go:5884.
+export function withImages(m: Message): boolean {
+  return m.Parts.some(p => p.Kind === "image");
+}
+export interface TurnState { turn: number; within: boolean; newTurn: boolean }
+interface TurnWalk { answered: boolean; results: boolean; turn: number; within: boolean }
+// One message of gateway/affinity.go:408 turnIn. The switch order matters:
+// a tool result carries the turn on even when the same message has text.
+function walkTurn(w: TurnWalk, m: Message): boolean {
+  if (m.Role === "assistant") {
+    w.answered = true;
+    w.results = false;
+    return false;
+  }
+  if (m.Role !== "user") return false;
+  let said = saysAnything(m), result = false;
+  for (const p of m.Parts) {
+    if (p.Kind === "image" || p.Kind === "file") said = true;
+    else if (p.Kind === "tool_result") result = true;
+  }
+  const before = w.turn;
+  if (result) {
+    w.within = true;
+    w.results = true;
+  } else if (w.results && withImages(m)) {
+    w.within = true;
+  } else if (said) {
+    w.turn++;
+    w.within = false;
+  } else if (w.answered) {
+    w.within = w.turn > 0;
+  }
+  w.answered = false;
+  return w.turn > before;
+}
+// Ported from gateway/affinity.go:408. The parity fixture calls this whole
+// function against Go; history uses turnStates for the same walk per message.
+export function turnIn(messages: Message[]): { turn: number; within: boolean } {
+  const w: TurnWalk = { answered: false, results: false, turn: 0, within: false };
+  for (const m of messages) walkTurn(w, m);
+  return { turn: w.turn, within: w.within };
+}
+export function turnStates(messages: Message[]): TurnState[] {
+  const w: TurnWalk = { answered: false, results: false, turn: 0, within: false };
+  return messages.map(m => {
+    const newTurn = walkTurn(w, m);
+    return { turn: w.turn, within: w.within, newTurn };
+  });
+}
 export function assistantSaid(m: Message): string {
   return m.Parts.filter(p => p.Kind === "text").map(p => trimSpace(p.Text ?? "")).filter(Boolean).join("\n");
 }
