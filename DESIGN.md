@@ -223,6 +223,24 @@ magpie（yetone/magpie）社区插件。用**历史会话**回测路由组的 `i
 - `POST /api/run` 的参数改为 `{group, draft, sessions:[id], k, stopAfterHit}`，去掉 limit。
 - 返回结果按会话分组：`sessions:[{id, agent, folder, turns, class, firstHit, switched, from, to, prefixTokens, rows:[…]}]`，另附 `summary.timing`。
 
+## 阶段 F：一个条目 = 一个主会话（2026-11-12 与用户确认）
+
+用户反馈：「选会话」列表看起来像把一个会话的消息逐条列了出来。实际原因是，最近 30 条里大部分是 Claude Code 子 agent 的 transcript（`<项目>/<会话id>/subagents/agent-*.jsonl`），以及 Orca 生成会话标题的单轮辅助调用（首条消息是「Name this chat from the user's first request…」，entrypoint 为 sdk-cli）。
+
+- **辅助调用直接排除**：claude 会话中只有 1 轮、首条 `userSaid` 以 `Name this chat from the user's first request` 开头的，不进入目录、搜索和回测。条件写成一个具名的谓词，便于以后扩展。
+- **子 agent 并入主会话**：
+  - claude：`<项目>/<id>/subagents/agent-*.jsonl` 的父会话是 `<项目>/<id>.jsonl`。
+  - codex 和 pi：先实际查看它们是否有子 agent 或父会话的标记（例如 codex 的 session_meta 和 parent thread 字段）。有就同样并入；没有就在回报里说明。
+  - **目录**：条目只列主会话，显示「含 N 个子 agent」。会话时间取主会话和子 agent 中最晚的一轮。「最近 N 个会话」只数主会话。
+  - **搜索**：搜索范围同样覆盖子 agent 的内容。子 agent 命中时算作父会话命中，片段标「子 agent」。
+  - **预览浮层**：主会话按时间显示，子 agent 折叠成独立的块，标出 agent id 和首条消息摘要，可以展开。
+- **回测默认包含子 agent**：
+  - 每个子 agent 是一段**独立的对话**：自己的 turn 序列、上一轮上下文和粘性。magpie 按子 agent 自己的会话键粘住，初始成员取该子 agent 自己的 routing 记录。
+  - **结果视图**：主会话一行，带时间线；它的子 agent 缩进列在下面，各自有时间线，默认折叠成「N 个子 agent：开头 a / 中途 b / 未命中 c」，点开逐个查看。
+  - **E3 汇总分两栏**：主会话、子 agent 各自统计开头命中、中途命中、未命中、单轮的数量，以及第一次命中轮次的直方图和切换代价。
+  - 面板上加一个「包含子 agent」开关，默认开。
+- **插件自己调 Jev 时带上标识**：请求加 `User-Agent: magpie-intent-lab/<version>`。现在 magpie 的路由日志里把这些请求记成 agent「Bun」，2026-11-12 当天已有约 4700 条。先确认 magpie 的 `usage.AgentOf` 会怎么识别这个 UA，在回报里写明日志里实际显示成什么。
+
 ## 验收
 
 - **对拍（parity）**：`scripts/parity.sh` 在 `/tmp/magpie-latest` 的临时副本里加一个 Go 测试，对 `fixtures/*.json`（原始 messages）输出 `userSaid`、`lastSaid`、`cutMiddle`、`turnBefore`、`jevBody`。TS 对同一批输入输出同样的内容，逐字节比较，打印 `parity: N/N identical`。
