@@ -14,6 +14,10 @@ const state = {
   filterChanged: false,
   filterIntent: "",
   applyPreviewed: false,
+  sessionResults: [],
+  selectedSessions: new Set(),
+  sessionSearchActive: false,
+  sessionQuery: { q: "", regex: false },
 };
 
 function el(tag, className, text) {
@@ -40,6 +44,84 @@ function shortText(text, length = 160) {
 
 function sureText(value) {
   return typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : "—";
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+
+function searchRegExp(q, regex) {
+  if (!q) return null;
+  try {
+    return new RegExp(regex ? q : q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+  } catch {
+    return null;
+  }
+}
+
+function highlightHtml(text, q, regex) {
+  const value = String(text ?? "");
+  const re = searchRegExp(q, regex);
+  if (!re) return escapeHtml(value);
+  let out = "", at = 0;
+  re.lastIndex = 0;
+  for (;;) {
+    const hit = re.exec(value);
+    if (!hit) break;
+    out += escapeHtml(value.slice(at, hit.index));
+    out += `<mark>${escapeHtml(hit[0])}</mark>`;
+    at = hit.index + hit[0].length;
+    if (!hit[0].length) re.lastIndex++;
+    if (re.lastIndex > value.length) break;
+  }
+  return out + escapeHtml(value.slice(at));
+}
+
+function kv(label, value) {
+  const row = el("div", "kv");
+  row.append(el("span", "", label));
+  row.append(el("b", "", String(value ?? "—")));
+  return row;
+}
+
+function renderLogic() {
+  const wrap = $("#logic-body");
+  wrap.replaceChildren();
+  const logic = state.group?.logic;
+  if (!logic) {
+    wrap.append(el("p", "empty-state", "这个组没有可展示的判定逻辑。"));
+    return;
+  }
+  const head = el("div", "logic-group");
+  head.append(el("b", "", logic.group.id));
+  head.append(el("span", "", `分类器 ${logic.group.classifier || "—"} · 阈值 ${logic.group.threshold} · ${logic.group.ruleCount} 条规则`));
+  head.append(el("span", "", `上游 ${logic.upstream}`));
+  wrap.append(head);
+  for (const step of logic.steps) {
+    const card = el("div", "logic-step");
+    card.dataset.testid = "logic-step";
+    const title = el("div", "logic-step-head");
+    title.append(el("span", "num", String(step.n)));
+    title.append(el("b", "", step.title));
+    title.append(el("span", "source", step.source));
+    card.append(title);
+    card.append(el("p", "logic-copy", step.body));
+    const facts = el("div", "logic-facts");
+    for (const fact of step.facts) {
+      const box = el("div", "logic-fact");
+      box.append(el("span", "label", fact.label));
+      if (fact.items?.length) {
+        const list = el("span", "chips");
+        for (const item of fact.items) list.append(el("code", "", item));
+        box.append(list);
+      } else {
+        box.append(el("code", "", fact.value ?? "—"));
+      }
+      facts.append(box);
+    }
+    card.append(facts);
+    wrap.append(card);
+  }
 }
 
 function ruleSummary(rule) {
@@ -172,6 +254,7 @@ function selectGroup(id) {
   state.result = null;
   $("#group-select").value = group.id;
   renderGroupMeta();
+  renderLogic();
   renderCurrentRules();
   renderDraft();
   renderResults();
@@ -362,8 +445,144 @@ function renderIntentFilter() {
   select.value = state.filterIntent;
 }
 
+function traceBlock(title, side, row, testid) {
+  const trace = side?.trace;
+  const box = el("div", "trace-block wide");
+  box.dataset.testid = testid;
+  box.append(el("h3", "", title));
+  if (!trace) {
+    box.append(el("div", "empty-state", "这一侧没有 trace。"));
+    return box;
+  }
+
+  const message = el("div", "trace-section");
+  message.append(el("h4", "", "最终发给 Jev 的 message"));
+  const pre = el("pre", "trace-message", trace.cut?.message || "（空）");
+  pre.dataset.testid = testid + "-message";
+  message.append(pre);
+  const stripped = el("div", "trace-facts");
+  stripped.append(kv("原始字数", trace.stripped.originalChars));
+  stripped.append(kv("system-reminder 段数", trace.stripped.reminders));
+  stripped.append(kv("## My request: 之前字数", trace.stripped.beforeRequestChars));
+  stripped.append(kv("整段判为注入", trace.stripped.wholeInjection ? "是" : "否"));
+  stripped.append(kv("截断", trace.cut?.truncated ? `前 ${trace.cut.head} + 后 ${trace.cut.tail}` : "未截断"));
+  message.append(stripped);
+  box.append(message);
+
+  const prev = el("div", "trace-section");
+  prev.append(el("h4", "", "上一轮上下文"));
+  prev.append(el("div", "trace-label", "previous_user_message"));
+  prev.append(el("pre", "", trace.prev.user || "（无）"));
+  prev.append(el("div", "trace-label", "previous_assistant_reply"));
+  prev.append(el("pre", "", trace.prev.reply || "（无）"));
+  const prevFacts = el("div", "trace-facts");
+  prevFacts.append(kv("previous_message_kind", trace.prev.intent || "（无）"));
+  prevFacts.append(kv("是否携带", trace.prev.carried ? "是" : "否"));
+  prevFacts.append(kv("候选 intents", trace.prev.candidates.length ? trace.prev.candidates.join(" / ") : "（无）"));
+  prev.append(prevFacts);
+  box.append(prev);
+
+  const jev = el("div", "trace-section");
+  jev.append(el("h4", "", "Jev 返回"));
+  if (!trace.jevAnswer) {
+    jev.append(el("div", "empty-state", "没有候选 intent，未调用 Jev。"));
+  } else {
+    const answer = trace.jevAnswer;
+    const facts = el("div", "trace-facts");
+    facts.append(kv("model", answer.model || "—"));
+    facts.append(kv("choice", answer.choice || "（空）"));
+    facts.append(kv("confidence", sureText(answer.confidence)));
+    facts.append(kv("sure", sureText(trace.sure)));
+    facts.append(kv("阈值", sureText(trace.threshold)));
+    const passed = el("span", trace.passed ? "badge" : "badge warn", trace.passed ? "是" : "否");
+    const passedRow = el("div", "kv");
+    passedRow.append(el("span", "", "阈值达标"));
+    passedRow.append(passed);
+    facts.append(passedRow);
+    facts.append(kv("答案接受", trace.accepted ? "是" : "否"));
+    facts.append(kv("最终 intent", trace.intent || "（none）"));
+    facts.append(kv("缓存", trace.cached ? "命中" : "新请求"));
+    jev.append(facts);
+    const probs = Object.entries(answer.probabilities || {}).sort((a, b) => b[1] - a[1]);
+    const bars = el("div", "probabilities");
+    if (!probs.length) bars.append(el("div", "muted", "答案没有 probabilities。"));
+    for (const [label, value] of probs) {
+      const row = el("div", "prob-row");
+      row.append(el("span", "prob-label", label));
+      const bar = el("div", "prob-bar");
+      const fill = el("div", "prob-fill");
+      fill.style.width = `${Math.max(0, Math.min(1, value)) * 100}%`;
+      bar.append(fill);
+      row.append(bar);
+      row.append(el("span", "prob-value", sureText(value)));
+      bars.append(row);
+    }
+    jev.append(bars);
+  }
+  if (trace.levelProbe) {
+    const probe = el("div", "trace-section level-probe");
+    probe.append(el("h4", "", "levels 探测"));
+    const facts = el("div", "trace-facts");
+    facts.append(kv("结果", trace.levelProbe.levels ? "levels" : "topics"));
+    facts.append(kv("探测缓存", trace.levelProbe.cached ? "命中" : "新请求"));
+    if (trace.levelProbe.work) {
+      for (const [intent, work] of Object.entries(trace.levelProbe.work)) {
+        facts.append(kv(intent, work));
+      }
+    }
+    probe.append(facts);
+    jev.append(probe);
+  }
+  box.append(jev);
+
+  const walk = el("div", "trace-section");
+  walk.append(el("h4", "", "规则逐条判定"));
+  const walkNode = el("div", "rule-walk");
+  walkNode.dataset.testid = testid + "-rulewalk";
+  for (const rule of trace.ruleWalk || []) {
+    const card = el("div", "rule-walk-item" + (rule.chosen ? " chosen" : ""));
+    const head = el("div", "rule-walk-head");
+    head.append(el("b", "", `规则 ${rule.n}`));
+    head.append(el("span", "muted", rule.use || "（无 use）"));
+    if (rule.chosen) head.append(el("span", "badge", "选中"));
+    card.append(head);
+    const conds = el("div", "conds");
+    for (const cond of rule.conds || []) {
+      const icon = cond.result === "pass" ? "✓" : cond.result === "fail" ? "✗" : "?";
+      const row = el("div", "cond " + cond.result);
+      row.append(el("span", "cond-icon", icon));
+      row.append(el("span", "cond-name", cond.name));
+      row.append(el("span", "cond-detail", `期望 ${cond.want} · 实际 ${cond.got} — ${cond.why}`));
+      conds.append(row);
+    }
+    card.append(conds);
+    walkNode.append(card);
+  }
+  const chosen = el("div", "chosen-rule");
+  chosen.textContent = trace.chosen?.n
+    ? `选中规则 ${trace.chosen.n} · ${trace.chosen.use}`
+    : "未命中规则，按组默认路由";
+  walk.append(walkNode);
+  walk.append(chosen);
+  box.append(walk);
+
+  const rawBox = (label, value, id) => {
+    const details = document.createElement("details");
+    details.dataset.testid = id;
+    const summary = document.createElement("summary");
+    summary.textContent = label;
+    details.append(summary);
+    details.append(el("pre", "", JSON.stringify(value, null, 2)));
+    return details;
+  };
+  box.append(rawBox("原始请求体", trace.jevRequest, testid + "-request"));
+  box.append(rawBox("原始答案 JSON", trace.jevAnswer?.raw ?? null, testid + "-answer"));
+  return box;
+}
+
 function detailRow(row) {
   const tr = el("tr", "detail");
+  tr.dataset.testid = "row-detail";
   const td = document.createElement("td");
   td.colSpan = 8;
   const grid = el("div", "detail-grid");
@@ -375,35 +594,201 @@ function detailRow(row) {
 
   const prev = el("div");
   prev.append(el("h3", "", "上一轮上下文"));
-  const user = el("pre", "", row.prev?.user || "(无)");
-  const reply = el("pre", "", row.prev?.reply || "(无)");
   prev.append(el("h3", "", "上一轮用户"));
-  prev.append(user);
+  prev.append(el("pre", "", row.prev?.user || "(无)"));
   prev.append(el("h3", "", "上一轮回复"));
-  prev.append(reply);
+  prev.append(el("pre", "", row.prev?.reply || "(无)"));
   grid.append(prev);
 
-  const raw = (title, side, value) => {
-    const box = el("div");
-    box.append(el("h3", "", title));
-    if (value === undefined || value === null) {
-      box.append(el("div", "empty-state", "(没有调用 Jev)"));
-      return box;
-    }
-    const details = document.createElement("details");
-    const summary = document.createElement("summary");
-    summary.textContent = "展开原始答案";
-    details.append(summary);
-    details.append(el("pre", "", JSON.stringify(value, null, 2)));
-    box.append(details);
-    return box;
-  };
-  grid.append(raw("当前 Jev 原始答案", "current", row.currentRaw));
-  grid.append(raw("草稿 Jev 原始答案", "draft", row.draftRaw));
+  grid.append(traceBlock("当前判定过程", row.current, row, "trace-current"));
+  grid.append(traceBlock("草稿判定过程", row.draft, row, "trace-draft"));
 
   td.append(grid);
   tr.append(td);
   return tr;
+}
+
+function sessionScopes() {
+  return [...document.querySelectorAll(".scope:checked")].map(node => node.value);
+}
+
+function renderSessionList(data) {
+  const list = $("#session-list");
+  list.replaceChildren();
+  if (!data.sessions.length) {
+    list.append(el("p", "empty-state", "没有命中的会话。"));
+    return;
+  }
+  for (const session of data.sessions) {
+    const card = el("div", "session-card");
+    const head = el("div", "session-card-head");
+    const check = document.createElement("label");
+    check.className = "session-check";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = state.selectedSessions.has(session.id);
+    box.dataset.testid = "session-checkbox";
+    box.dataset.sessionId = session.id;
+    box.addEventListener("change", () => {
+      if (box.checked) state.selectedSessions.add(session.id);
+      else state.selectedSessions.delete(session.id);
+    });
+    check.append(box);
+    check.append(el("span", "session-agent", `${session.agent} · ${session.folder || "—"}`));
+    head.append(check);
+    const preview = el("button", "secondary", "预览");
+    preview.type = "button";
+    preview.dataset.testid = "session-preview";
+    preview.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      openSession(session.id);
+    });
+    head.append(preview);
+    card.append(head);
+    card.append(el("div", "session-time", `${formatTime(session.start)} → ${formatTime(session.end)}`));
+    card.append(el("div", "session-first", session.first || "（首条消息为空）"));
+    card.append(el("div", "session-meta", `命中 ${session.hits} 次 · ${session.turns} 个 turn`));
+    const snippets = el("div", "snippets");
+    for (const snippet of (session.snippets || []).slice(0, 3)) {
+      const row = el("div", "snippet");
+      row.append(el("span", "scope", snippet.scope));
+      const text = el("span", "snippet-text");
+      text.innerHTML = (snippet.lead ? "…" : "") + highlightHtml(snippet.text, state.sessionQuery.q, state.sessionQuery.regex) + (snippet.trail ? "…" : "");
+      row.append(text);
+      snippets.append(row);
+    }
+    card.append(snippets);
+    list.append(card);
+  }
+}
+
+async function searchSessionList() {
+  const q = $("#session-search").value.trim();
+  const status = $("#session-status");
+  const button = $("#session-search-button");
+  status.classList.remove("warn");
+  if (!q) {
+    clearSessionSearch();
+    return;
+  }
+  const scopes = sessionScopes();
+  if (!scopes.length) {
+    status.textContent = "至少选择一个搜索范围。";
+    status.classList.add("warn");
+    return;
+  }
+  const params = new URLSearchParams({ q, scopes: scopes.join(","), limit: "100" });
+  if ($("#session-regex").checked) params.set("regex", "1");
+  if ($("#from").value) params.set("from", $("#from").value);
+  if ($("#to").value) params.set("to", $("#to").value);
+  button.disabled = true;
+  status.textContent = "搜索中…";
+  try {
+    const response = await api("/api/sessions?" + params.toString());
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    state.sessionResults = data.sessions ?? [];
+    state.selectedSessions = new Set(state.sessionResults.map(session => session.id));
+    state.sessionSearchActive = true;
+    state.sessionQuery = { q, regex: $("#session-regex").checked };
+    renderSessionList(data);
+    status.textContent = `命中 ${state.sessionResults.length} 个会话 · 搜索耗时 ${data.durationMs} ms`;
+  } catch (error) {
+    state.sessionSearchActive = false;
+    state.sessionResults = [];
+    state.selectedSessions.clear();
+    $("#session-list").replaceChildren();
+    status.textContent = "搜索失败：" + (error?.message || String(error));
+    status.classList.add("warn");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function clearSessionSearch() {
+  state.sessionResults = [];
+  state.selectedSessions.clear();
+  state.sessionSearchActive = false;
+  state.sessionQuery = { q: "", regex: false };
+  $("#session-search").value = "";
+  $("#session-list").replaceChildren();
+  const status = $("#session-status");
+  status.classList.remove("warn");
+  status.textContent = "未搜索：回测使用最近 N 个 turn。";
+}
+
+function closeSessionModal() {
+  const modal = $("#session-modal");
+  modal.hidden = true;
+  document.body.classList.remove("modal-open");
+  $("#session-modal-body").replaceChildren();
+}
+
+function renderPreview(data) {
+  const body = $("#session-modal-body");
+  body.replaceChildren();
+  body.append(el("div", "preview-meta", `${data.agent} · ${data.folder || "—"} · ${data.turnCount} 个回测 turn`));
+  data.items.forEach((item, index) => {
+    if (item.kind === "bash") {
+      const details = document.createElement("details");
+      details.className = "preview-item bash";
+      details.dataset.index = String(index);
+      details.dataset.testid = "preview-bash";
+      const summary = document.createElement("summary");
+      summary.innerHTML = `bash · ${highlightHtml(shortText(item.command || "（无命令）", 100), state.sessionQuery.q, state.sessionQuery.regex)}`;
+      details.append(summary);
+      const command = el("pre", "", "");
+      command.innerHTML = highlightHtml(item.command || "（无命令）", state.sessionQuery.q, state.sessionQuery.regex);
+      details.append(command);
+      const output = el("pre", "", "");
+      output.innerHTML = highlightHtml(item.output || "（无输出）", state.sessionQuery.q, state.sessionQuery.regex);
+      details.append(output);
+      body.append(details);
+      return;
+    }
+    const node = el("div", "preview-item " + item.kind);
+    node.dataset.index = String(index);
+    node.dataset.testid = item.kind === "user" ? "preview-user" : "preview-assistant";
+    if (item.sampleId) {
+      node.classList.add("sample-turn");
+      node.dataset.sampleId = item.sampleId;
+      node.append(el("span", "badge", "回测样本"));
+    }
+    const text = el("div", "preview-text");
+    text.innerHTML = highlightHtml(item.text || "", state.sessionQuery.q, state.sessionQuery.regex);
+    node.append(text);
+    body.append(node);
+  });
+  if (data.focus >= 0) {
+    const target = body.querySelector(`[data-index="${data.focus}"]`);
+    if (target) {
+      target.classList.add("focus");
+      target.scrollIntoView({ block: "center" });
+    }
+  }
+}
+
+async function openSession(id, sampleId) {
+  const modal = $("#session-modal");
+  modal.hidden = false;
+  document.body.classList.add("modal-open");
+  const body = $("#session-modal-body");
+  body.replaceChildren(el("p", "empty-state", "正在读取会话…"));
+  $("#session-modal-title").textContent = "会话预览";
+  const params = new URLSearchParams({ id });
+  if (sampleId) params.set("sample", sampleId);
+  if ($("#from").value) params.set("from", $("#from").value);
+  if ($("#to").value) params.set("to", $("#to").value);
+  try {
+    const response = await api("/api/session?" + params.toString());
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    $("#session-modal-title").textContent = `${data.agent} · ${data.folder || "会话预览"}`;
+    renderPreview(data);
+  } catch (error) {
+    body.replaceChildren(el("p", "warn", "读取会话失败：" + (error?.message || String(error))));
+  }
 }
 
 function renderResults() {
@@ -438,7 +823,19 @@ function renderResults() {
     tr.append(cell("时间", formatTime(row.time)));
     tr.append(cell("agent", row.agent));
     tr.append(cell("folder", row.folder || "—"));
-    tr.append(cell("消息摘要", shortText(row.fullText || row.text, 120), "msg"));
+    const messageCell = el("div", "msg-cell");
+    messageCell.append(el("span", "msg-text", shortText(row.fullText || row.text, 120)));
+    if (row.sessionId) {
+      const preview = el("button", "secondary tiny", "预览会话");
+      preview.type = "button";
+      preview.dataset.testid = "preview-result";
+      preview.addEventListener("click", event => {
+        event.stopPropagation();
+        openSession(row.sessionId, row.id);
+      });
+      messageCell.append(preview);
+    }
+    tr.append(cell("消息摘要", messageCell, "msg"));
     tr.append(cell("当前 intent · sure · 模型", sideCell(row.current)));
     tr.append(cell("草稿 intent · sure · 模型", sideCell(row.draft)));
     const changed = el("span", row.changed ? "badge" : "badge none", row.changed ? "变化" : "—");
@@ -557,6 +954,21 @@ function renderApplyResult(data) {
   }
 }
 
+$("#session-search-button").addEventListener("click", () => searchSessionList());
+$("#session-search").addEventListener("keydown", event => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    searchSessionList();
+  }
+});
+$("#session-clear").addEventListener("click", () => clearSessionSearch());
+$("#session-modal").addEventListener("click", event => {
+  if (event.target?.dataset?.close) closeSessionModal();
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && !$("#session-modal").hidden) closeSessionModal();
+});
+
 $("#group-select").addEventListener("change", event => selectGroup(event.target.value));
 
 $("#intent-sure").addEventListener("input", event => {
@@ -607,6 +1019,15 @@ $("#run-button").addEventListener("click", async () => {
   };
   if ($("#from").value) body.from = $("#from").value;
   if ($("#to").value) body.to = $("#to").value;
+  if (state.sessionSearchActive) {
+    const selected = [...state.selectedSessions];
+    if (!selected.length) {
+      errorNode.textContent = "至少勾选一个会话。";
+      setHidden(errorNode, false);
+      return;
+    }
+    body.sessions = selected;
+  }
   $("#run-button").disabled = true;
   setHidden($("#progress-wrap"), false);
   setProgress(0, 0, "history");

@@ -42,6 +42,36 @@
     </div>
   </section>
 
+
+  <section class="panel" id="logic-panel" data-testid="logic-panel">
+    <details open>
+      <summary data-testid="logic-toggle"><span class="summary-title">判定逻辑</span> <span class="muted">当前组实际参数 · 上游源码位置</span></summary>
+      <div id="logic-body" class="logic-body"><p class="empty-state">正在读取…</p></div>
+    </details>
+  </section>
+
+
+  <section class="panel" id="session-panel" data-testid="session-panel">
+    <h2>会话过滤 <span class="muted">搜索只用来选会话；选中的会话按日期/agent 回测全部 turn</span></h2>
+    <div class="filter-row">
+      <input type="text" id="session-search" data-testid="session-search" placeholder="搜索会话内容…" autocomplete="off">
+      <label><input type="checkbox" id="session-regex" data-testid="session-regex"> 正则</label>
+      <button id="session-search-button" data-testid="session-search-button" type="button">搜索会话</button>
+      <button id="session-clear" class="secondary" type="button">清除</button>
+    </div>
+    <div class="filter-row" id="session-scopes" data-testid="session-scopes">
+      <fieldset>
+        <legend>搜索范围</legend>
+        <label><input type="checkbox" class="scope" value="first" checked> 首条消息</label>
+        <label><input type="checkbox" class="scope" value="user"> 全部 user 消息</label>
+        <label><input type="checkbox" class="scope" value="reply"> agent 回复</label>
+        <label><input type="checkbox" class="scope" value="bash"> bash 命令 + 结果</label>
+      </fieldset>
+    </div>
+    <p id="session-status" class="muted">未搜索：回测使用最近 N 个 turn。</p>
+    <div id="session-list" data-testid="session-list"></div>
+  </section>
+
   <section class="panel" id="samples-panel">
     <h2>样本条件</h2>
     <div class="filter-row">
@@ -106,6 +136,17 @@
     <pre id="apply-commands" data-testid="apply-commands" hidden></pre>
     <pre id="apply-readback" data-testid="apply-readback" hidden></pre>
   </section>
+
+<div id="session-modal" class="modal" data-testid="session-modal" hidden>
+  <div class="modal-backdrop" data-close="1"></div>
+  <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="session-modal-title">
+    <div class="modal-head">
+      <h2 id="session-modal-title">会话预览</h2>
+      <button id="session-modal-close" class="secondary" type="button" data-close="1">关闭</button>
+    </div>
+    <div id="session-modal-body" class="modal-body"></div>
+  </div>
+</div>
 </div>
 <script src="ui/app.js"></script>
 </body>

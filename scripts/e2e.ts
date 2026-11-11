@@ -176,6 +176,50 @@ try {
   const index = await fetch(base + "/", { headers: { origin: "null" } });
   assert.equal(index.headers.get("access-control-allow-origin"), null, "the HTML holding the token must carry no CORS header");
   check("8 frame page has no inline script; service guard", { refused: ["no token", "foreign origin", "foreign host"], allowed: "Origin null + token" });
+  // 9: search a word from the first real sample's first message, then a real
+  // bash command. The search only picks sessions; the run below replays all
+  // turns of the picked sessions.
+  const firstMessage = samples.samples[0].fullText || samples.samples[0].text;
+  const word = (firstMessage.match(/[A-Za-z][A-Za-z0-9_-]{2,}/) ?? firstMessage.match(/\p{L}{2,}/) ?? ["git"])[0];
+  const firstSearch = await json(`/api/sessions?q=${encodeURIComponent(word)}&scopes=first&limit=100`);
+  artifact.sessionSearch = { word, durationMs: firstSearch.durationMs, sessions: firstSearch.sessions.length };
+  assert.ok(firstSearch.sessions.length >= 1, `first-message search for ${word} must find a session`);
+  assert.ok(firstSearch.sessions.some((session: any) => session.snippets.some((snippet: any) => snippet.text.toLowerCase().includes(word.toLowerCase()))), "the first search snippet must contain the word");
+  assert.ok(firstSearch.durationMs < 5000, `full search must be under 5s, took ${firstSearch.durationMs}ms`);
+  console.log(`search first "${word}": ${firstSearch.sessions.length} sessions in ${firstSearch.durationMs}ms`);
+  const bashQuery = "git status";
+  const bashSearch = await json(`/api/sessions?q=${encodeURIComponent(bashQuery)}&scopes=bash&limit=100`);
+  artifact.bashSearch = { query: bashQuery, durationMs: bashSearch.durationMs, sessions: bashSearch.sessions.length };
+  assert.ok(bashSearch.sessions.length >= 1, `bash search for ${bashQuery} must find a session`);
+  assert.ok(bashSearch.sessions.some((session: any) => session.snippets.some((snippet: any) => snippet.scope === "bash" && snippet.text.toLowerCase().includes(bashQuery))), "the bash snippet must contain the command");
+  assert.ok(bashSearch.durationMs < 5000, `full bash search must be under 5s, took ${bashSearch.durationMs}ms`);
+  console.log(`search bash "${bashQuery}": ${bashSearch.sessions.length} sessions in ${bashSearch.durationMs}ms`);
+  check("9 session search first-message and bash", { word, first: firstSearch.sessions.length, bash: bashSearch.sessions.length });
+  // 10: two selected sessions. Every returned row must belong to one of
+  // them, and each session's rows must equal its in-range turn count.
+  const picked = firstSearch.sessions.slice(0, 2);
+  assert.equal(picked.length, 2, "the first search must return at least two sessions for this check");
+  const restricted = await run({ group: group.id, draft, sessions: picked.map((session: any) => session.id) });
+  artifact.sessionRun = { picked: picked.map((session: any) => ({ id: session.id, turns: session.turns })), rows: restricted.result.rows.length };
+  assert.ok(restricted.result.rows.length > 0, "selected sessions must replay turns");
+  const allowed = new Set(picked.map((session: any) => session.id));
+  for (const row of restricted.result.rows) assert.ok(allowed.has(row.sessionId), `row ${row.id} is outside the picked sessions`);
+  const counts = new Map<string, number>();
+  for (const row of restricted.result.rows) counts.set(row.sessionId, (counts.get(row.sessionId) ?? 0) + 1);
+  for (const session of picked) assert.equal(counts.get(session.id) ?? 0, session.turns, `session ${session.id} row count must equal its turn count`);
+  check("10 selected sessions only; per-session row counts", { sessions: picked.length, rows: restricted.result.rows.length });
+  // 11: every row carries the trace captured by the replay itself.
+  for (const row of restricted.result.rows) {
+    for (const side of ["current", "draft"] as const) {
+      const trace = row[side]?.trace;
+      assert.ok(trace, `row ${row.id} ${side} must have a trace`);
+      assert.equal(trace.jevRequest.state.message, row.text, `row ${row.id} ${side} request message must be the replayed text`);
+      assert.equal(trace.chosen.n, row[side].rule, `row ${row.id} ${side} chosen rule must match the result`);
+      assert.equal(trace.ruleWalk.find((rule: any) => rule.chosen)?.n ?? 0, row[side].rule, `row ${row.id} ${side} rule walk must agree`);
+      if (trace.jevAnswer?.topic) assert.equal(trace.passed, trace.sure >= trace.threshold, `row ${row.id} ${side} topic passed must be sure >= threshold`);
+    }
+  }
+  check("11 per-row trace", { rows: restricted.result.rows.length, sides: ["current", "draft"] });
   artifact.status = "PASS";
 } catch (error: any) {
   artifact.status = "FAIL";

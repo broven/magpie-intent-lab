@@ -12,7 +12,8 @@
     "parity": "bash scripts/parity.sh",
     "e2e": "bun scripts/e2e.ts",
     "ui-shot": "bun scripts/ui-shot.ts",
-    "frame-check": "bun scripts/frame-check.ts"
+    "frame-check": "bun scripts/frame-check.ts",
+    "upstream": "bun scripts/upstream.ts"
   },
   "dependencies": {
     "re2js": "2.10.0"

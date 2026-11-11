@@ -1,8 +1,10 @@
 import { readConfig, classifierSupport, type Group } from "./rules";
-import { readHistory, type Filters } from "./history";
+import { readHistory, sessionPath, type Filters } from "./history";
 import { replay } from "./replay";
 import { JevClient } from "./jev";
 import { planApply, type ApplyPlan } from "./apply";
+import { logicFor } from "./logic";
+import { searchSessions, sessionPreview } from "./sessions";
 import { dirname, extname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -205,7 +207,11 @@ function makeFetch(jev: JevClient, magpieBin: string) {
           .filter(g => (g.rules ?? []).some(r => r.intent))
           .map(g => {
             const support = classifierSupport(g.classifier, config.providers, config.modelAPIs);
-            return { ...g, intentSure: g.intentSure ?? null, supported: support.supported, reason: support.reason ?? null };
+            return {
+              ...g, intentSure: g.intentSure ?? null,
+              supported: support.supported, reason: support.reason ?? null,
+              logic: logicFor(g),
+            };
           });
         return json({ groups });
       }
@@ -217,6 +223,34 @@ function makeFetch(jev: JevClient, magpieBin: string) {
           limit: url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined,
         };
         return json(await readHistory(filters));
+      }
+      if (request.method === "GET" && url.pathname === "/api/sessions") {
+        try {
+          return json(await searchSessions({
+            q: url.searchParams.get("q") ?? undefined,
+            regex: url.searchParams.get("regex") === "1" || url.searchParams.get("regex") === "true",
+            scopes: url.searchParams.get("scopes") ?? undefined,
+            agents: url.searchParams.get("agents") ?? undefined,
+            from: url.searchParams.get("from") ?? undefined,
+            to: url.searchParams.get("to") ?? undefined,
+            limit: url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined,
+          }));
+        } catch (err: any) {
+          return failure(400, err?.message ?? String(err));
+        }
+      }
+      if (request.method === "GET" && url.pathname === "/api/session") {
+        const id = url.searchParams.get("id");
+        if (!id) return failure(400, "缺少 id");
+        try {
+          return json(await sessionPreview(id, {
+            from: url.searchParams.get("from") ?? undefined,
+            to: url.searchParams.get("to") ?? undefined,
+            sample: url.searchParams.get("sample") ?? undefined,
+          }));
+        } catch (err: any) {
+          return failure(400, err?.message ?? String(err));
+        }
       }
       if (request.method === "POST" && url.pathname === "/api/run") {
         let body: any;
@@ -232,6 +266,14 @@ function makeFetch(jev: JevClient, magpieBin: string) {
         } catch (err: any) {
           return failure(400, err.message ?? String(err));
         }
+        let sessions: string[] | undefined;
+        if (body?.sessions !== undefined) {
+          if (!Array.isArray(body.sessions) || body.sessions.some((id: unknown) => typeof id !== "string")) {
+            return failure(400, "sessions 必须是会话 id 数组");
+          }
+          if (!body.sessions.length) return failure(400, "sessions 不能为空");
+          sessions = body.sessions.map((id: string) => sessionPath(id));
+        }
         const encoder = new TextEncoder();
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
@@ -240,6 +282,7 @@ function makeFetch(jev: JevClient, magpieBin: string) {
                 sse(controller, encoder, "progress", { done: 0, total: 0, phase: "history" });
                 const history = await readHistory({
                   agents: body?.agents, from: body?.from, to: body?.to, limit: body?.limit,
+                  sessions,
                 });
                 if (!history.samples.length) throw new Error("没有符合条件的样本");
                 sse(controller, encoder, "progress", { done: 0, total: history.samples.length, phase: "replay" });

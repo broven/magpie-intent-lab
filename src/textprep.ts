@@ -1,10 +1,17 @@
 // Ported from gateway/prompt.go:712-786 and classify.go:264-335.
-export interface Part { Kind: string; Text?: string }
+export interface ToolCall { id?: string; name?: string; input?: unknown; output?: string }
+export interface Part { Kind: string; Text?: string; Call?: ToolCall }
 export interface Message { Role: string; Parts: Part[] }
 export interface Before { Intent?: string; Effort?: string; User?: string; Reply?: string }
 
 // Go strings.TrimSpace uses Unicode White_Space (JS trim treats BOM differently).
 export const trimSpace = (s: string): string => s.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
+export const reminderTag = "<system-reminder";
+export const myRequestMarker = "## My request:";
+// The cuts are shared with the decision-logic panel, so the interface never
+// keeps a second copy of these numbers.
+export const textCut = { head: 3000, tail: 1000, marker: "\n…\n" };
+export const prevCut = { userHead: 750, userTail: 250, replyTail: 1000, replyPrefix: "…" };
 const reminders = /<system-reminder(?:[\t\n\f\r ][^>]*)?>.*?<\/system-reminder>/gs;
 const myRequest = /^## My request(?: for Codex)?:[ \t]*\n?/gm;
 const agentsFor = /^# (\S+\.md) instructions for (\S.*?)[ \t]*\n/;
@@ -19,19 +26,48 @@ export const injected = [
   "Conversation rewind applied.", "Workspace rewind applied.",
   "The following deferred tools are", "# MCP Server Instructions", "The following MCP servers",
 ];
-export function userWords(text: string): string {
+export interface WordsDetail {
+  text: string;
+  originalChars: number;
+  reminders: number;
+  beforeRequestChars: number;
+  wholeInjection: boolean;
+}
+export function userWordsDetailed(text: string): WordsDetail {
+  const remindersCount = [...text.matchAll(reminders)].length;
   let t = text;
-  if (t.includes("<system-reminder")) t = t.replace(reminders, "");
+  if (t.includes(reminderTag)) t = t.replace(reminders, "");
   t = trimSpace(t);
+  let beforeRequestChars = 0;
   if (t.includes("## My request")) {
     const at = [...t.matchAll(myRequest)].at(-1);
-    if (at) t = trimSpace(t.slice(at.index! + at[0].length));
+    if (at) {
+      beforeRequestChars = Array.from(t.slice(0, at.index!)).length;
+      t = trimSpace(t.slice(at.index! + at[0].length));
+    }
   }
-  if (!t || agentsFor.test(t) || injected.some(lead => t.startsWith(lead))) return "";
-  return t;
+  const originalChars = Array.from(text).length;
+  if (!t || agentsFor.test(t) || injected.some(lead => t.startsWith(lead))) {
+    return { text: "", originalChars, reminders: remindersCount, beforeRequestChars, wholeInjection: trimSpace(text) !== "" };
+  }
+  return { text: t, originalChars, reminders: remindersCount, beforeRequestChars, wholeInjection: false };
+}
+export function userWords(text: string): string {
+  return userWordsDetailed(text).text;
+}
+export function userSaidDetailed(m: Message): WordsDetail {
+  const all = m.Parts.filter(p => p.Kind === "text").map(p => userWordsDetailed(p.Text ?? ""));
+  const parts = all.filter(p => p.text);
+  return {
+    text: parts.map(p => p.text).join("\n"),
+    originalChars: all.reduce((n, p) => n + p.originalChars, 0),
+    reminders: all.reduce((n, p) => n + p.reminders, 0),
+    beforeRequestChars: all.reduce((n, p) => n + p.beforeRequestChars, 0),
+    wholeInjection: all.length > 0 && all.every(p => p.wholeInjection),
+  };
 }
 export function userSaid(m: Message): string {
-  return m.Parts.filter(p => p.Kind === "text").map(p => userWords(p.Text ?? "")).filter(Boolean).join("\n");
+  return userSaidDetailed(m).text;
 }
 export function assistantSaid(m: Message): string {
   return m.Parts.filter(p => p.Kind === "text").map(p => trimSpace(p.Text ?? "")).filter(Boolean).join("\n");
@@ -45,12 +81,12 @@ export function lastSaid(messages: Message[], end = messages.length): { index: n
   }
   return { index: -1, text: "" };
 }
-export function cutMiddle(text: string, head: number, tail: number): string {
+export function cutMiddle(text: string, head: number, tail: number, marker = textCut.marker): string {
   const runes = Array.from(text);
-  return runes.length > head + tail ? runes.slice(0, head).join("") + "\n…\n" + runes.slice(runes.length - tail).join("") : text;
+  return runes.length > head + tail ? runes.slice(0, head).join("") + marker + runes.slice(runes.length - tail).join("") : text;
 }
 export function userText(messages: Message[]): string {
-  return cutMiddle(lastSaid(messages).text, 3000, 1000);
+  return cutMiddle(lastSaid(messages).text, textCut.head, textCut.tail);
 }
 export function turnBefore(messages: Message[]): { user: string; reply: string } {
   const { index: at } = lastSaid(messages);
@@ -61,6 +97,6 @@ export function turnBefore(messages: Message[]): { user: string; reply: string }
     if (messages[i].Role === "assistant") reply = assistantSaid(messages[i]);
   }
   const runes = Array.from(reply);
-  if (runes.length > 1000) reply = "…" + runes.slice(-1000).join("");
-  return { user: cutMiddle(user, 750, 250), reply };
+  if (runes.length > prevCut.replyTail) reply = prevCut.replyPrefix + runes.slice(-prevCut.replyTail).join("");
+  return { user: cutMiddle(user, prevCut.userHead, prevCut.userTail), reply };
 }

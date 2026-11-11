@@ -159,6 +159,120 @@ export function MatchesBesidesIntent(r: Rule, q: RuleRequest): boolean {
 export function Matches(r: Rule, q: RuleRequest): boolean {
   return (!r.intent || equalFold(r.intent, q.intent ?? "")) && MatchesBesidesIntent(r, q);
 }
+export interface TraceCond {
+  name: string; want: string; got: string;
+  result: "pass" | "fail" | "unknown"; why: string;
+}
+export interface TraceRule { n: number; use: string; conds: TraceCond[]; matched: boolean; chosen: boolean }
+export interface RuleWalk { index: number; walk: TraceRule[] }
+
+const shown = (value: unknown): string => {
+  if (value === undefined) return "—";
+  if (typeof value === "string") return value || "（空）";
+  return JSON.stringify(value);
+};
+function traceCond(name: string, want: unknown, got: unknown, result: TraceCond["result"], why: string): TraceCond {
+  return { name, want: shown(want), got: shown(got), result, why };
+}
+function unknownCond(name: string, want: unknown, got: unknown): TraceCond {
+  return traceCond(name, want, got, "unknown", "样本没有这个特征，按不匹配处理");
+}
+// Walks the same conditions Matches() reads, in the order it reads them, and
+// returns the first matching rule. Replay uses this walk for its actual pick,
+// so the trace is the decision, not a later reconstruction.
+export function walkRules(rules: Rule[], q: RuleRequest): RuleWalk {
+  const walk = rules.map((r, i): TraceRule => {
+    const conds: TraceCond[] = [];
+    if (r.pause) {
+      conds.push(traceCond("pause", false, true, "fail", "暂停规则不参与路由"));
+      return { n: i + 1, use: r.use, conds, matched: false, chosen: false };
+    }
+    if (r.intent) {
+      const pass = equalFold(r.intent, q.intent ?? "");
+      conds.push(traceCond("intent", r.intent, q.intent ?? "", pass ? "pass" : "fail", pass ? "intent 一致" : "intent 不一致"));
+    }
+    if ((r.tokens ?? 0) > 0) {
+      if (q.tokens === undefined) conds.push(unknownCond("tokens", `>= ${r.tokens}`, "—"));
+      else {
+        const pass = q.tokens >= r.tokens!;
+        conds.push(traceCond("tokens", `>= ${r.tokens}`, q.tokens, pass ? "pass" : "fail", pass ? "token 数达到门槛" : "token 数低于门槛"));
+      }
+    }
+    if (r.images) {
+      if (q.images === undefined) conds.push(unknownCond("images", true, "—"));
+      else conds.push(traceCond("images", true, q.images, q.images ? "pass" : "fail", q.images ? "带图片" : "没有图片"));
+    }
+    if (r.compact) {
+      if (q.compact === undefined) conds.push(unknownCond("compact", true, "—"));
+      else conds.push(traceCond("compact", true, q.compact, q.compact ? "pass" : "fail", q.compact ? "已压缩" : "未压缩"));
+    }
+    if (r.time) {
+      if (!q.time) conds.push(unknownCond("time", `${r.time.from}-${r.time.to}`, "—"));
+      else {
+        const pass = timeHolds(r.time, q.time);
+        conds.push(traceCond("time", `${r.time.from}-${r.time.to}`, q.time, pass ? "pass" : "fail", pass ? "在时间段内" : "不在时间段内"));
+      }
+    }
+    if (r.folders?.length) {
+      if (!q.folder) conds.push(unknownCond("folders", r.folders.join(","), "—"));
+      else {
+        const pass = r.folders.some(root => FolderUnder(q.folder!, root));
+        conds.push(traceCond("folders", r.folders.join(","), q.folder, pass ? "pass" : "fail", pass ? "folder 在列表内" : "folder 不在列表内"));
+      }
+    }
+    if (r.exceptFolders?.length) {
+      if (!q.folder) conds.push(unknownCond("exceptFolders", r.exceptFolders.join(","), "—"));
+      else {
+        const pass = !r.exceptFolders.some(root => FolderUnder(q.folder!, root));
+        conds.push(traceCond("exceptFolders", r.exceptFolders.join(","), q.folder, pass ? "pass" : "fail", pass ? "folder 不在排除列表" : "folder 在排除列表"));
+      }
+    }
+    if (r.effort) {
+      if (!effortKnown(q)) conds.push(unknownCond("effort", r.effort, "—"));
+      else {
+        let pass: boolean;
+        let why: string;
+        if (r.effort === "on") {
+          pass = !!(q.thinking || q.effort);
+          why = pass ? "思考已开启" : "思考未开启";
+        } else {
+          const want = efforts.indexOf(r.effort), have = efforts.indexOf(q.effort ?? "");
+          pass = !(have < want);
+          why = pass ? "effort 达到门槛" : "effort 低于门槛";
+        }
+        conds.push(traceCond("effort", r.effort, q.effort ?? (q.thinking ? "thinking" : "off"), pass ? "pass" : "fail", why));
+      }
+    }
+    if (r.agents?.length) {
+      if (q.agent === undefined) conds.push(unknownCond("agents", r.agents.join(","), "—"));
+      else {
+        const pass = r.agents.includes(q.agent.toLowerCase());
+        conds.push(traceCond("agents", r.agents.join(","), q.agent, pass ? "pass" : "fail", pass ? "agent 在列表内" : "agent 不在列表内"));
+      }
+    }
+    for (const c of r.where ?? []) {
+      const field = c.field;
+      const known = field in q && q[field as keyof RuleRequest] !== undefined && !(field === "effort" && !effortKnown(q, true));
+      const name = `where:${field} ${c.op}`;
+      if (!known) conds.push(unknownCond(name, c.value ?? "", "—"));
+      else {
+        const pass = condHolds(c, q);
+        conds.push(traceCond(name, c.value ?? "", shown(q[field as keyof RuleRequest]), pass ? "pass" : "fail", pass ? "条件成立" : "条件不成立"));
+      }
+    }
+    for (const key of Object.keys(r).filter(k => !ruleFields.has(k))) {
+      conds.push(unknownCond(key, "已知字段", "—"));
+    }
+    if (!hasCondition(r)) {
+      conds.push(traceCond("条件", "至少一个非 intent 条件", "无", "fail", "没有可匹配条件"));
+    }
+    const matched = conds.every(c => c.result === "pass");
+    return { n: i + 1, use: r.use, conds, matched, chosen: false };
+  });
+  const index = walk.findIndex(r => r.matched);
+  if (index >= 0) walk[index].chosen = true;
+  return { index, walk };
+}
 export function MatchRule(rules: Rule[], q: RuleRequest): number { return rules.findIndex(r => Matches(r, q)); }
 export function Intents(rules: Rule[], q: RuleRequest): string[] {
   const out: string[] = [];

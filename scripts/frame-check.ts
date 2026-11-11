@@ -88,7 +88,45 @@ try {
   if (!options.length) throw new Error(`the interface listed no groups in the sandboxed frame; console errors: ${errors.join(" | ")}`);
   const origin = await frame.evaluate(() => self.origin);
   if (origin !== "null") throw new Error(`frame origin is ${origin}, expected opaque "null"`);
-  console.log(`PASS frame went to ${frame.url()} (origin ${origin}); groups: ${options.join(", ")}`);
+
+  const logicSteps = await frame.$$eval('[data-testid="logic-step"]', (nodes: any[]) => nodes.length);
+  if (logicSteps < 7) throw new Error(`decision-logic panel has ${logicSteps} steps, expected 7`);
+
+  await frame.fill('[data-testid="session-search"]', "git");
+  for (const scope of ["user", "reply", "bash"]) await frame.check(`input.scope[value="${scope}"]`);
+  let found = false;
+  for (const term of ["git", "the"]) {
+    if (term !== "git") await frame.fill('[data-testid="session-search"]', term);
+    await frame.click('[data-testid="session-search-button"]');
+    try {
+      await frame.waitForSelector(".session-card", { timeout: 30_000 });
+      found = true;
+      break;
+    } catch { /* try the next common word */ }
+  }
+  if (!found) throw new Error("session search listed no sessions");
+  const sessionCards = await frame.$$eval(".session-card", (nodes: any[]) => nodes.length);
+  if (!sessionCards) throw new Error("session search listed no session cards");
+
+  await frame.click('[data-testid="session-preview"]');
+  await frame.waitForSelector("#session-modal:not([hidden])", { timeout: 15_000 });
+  await frame.waitForSelector("#session-modal .preview-item", { timeout: 30_000 });
+  const previewText = await frame.$eval("#session-modal-body", (node: any) => node.textContent ?? "");
+  if (!previewText.trim()) throw new Error("session preview modal is empty");
+  const previewItems = await frame.$$eval('[data-testid="preview-user"], [data-testid="preview-bash"]', (nodes: any[]) => nodes.length);
+  if (!previewItems) throw new Error("session preview has no messages or bash events");
+  await page.keyboard.press("Escape");
+  await frame.waitForSelector("#session-modal", { state: "hidden", timeout: 5_000 });
+
+  await frame.click("#session-clear");
+  await frame.fill('[data-testid="limit-input"]', "5");
+  await frame.click('[data-testid="run-button"]');
+  await frame.waitForSelector('[data-testid="result-table"] tbody tr.result-row', { timeout: 240_000 });
+  await frame.click('[data-testid="result-table"] tbody tr.result-row');
+  await frame.waitForSelector("tr.detail", { timeout: 10_000 });
+  const detail = await frame.$eval("tr.detail", (node: any) => node.textContent ?? "");
+  if (!detail.includes("判定过程")) throw new Error("expanded row has no 判定过程 trace");
+  console.log(`PASS frame went to ${frame.url()} (origin ${origin}); groups: ${options.join(", ")}; logic steps: ${logicSteps}; sessions: ${sessionCards}; trace: 判定过程`);
 } catch (err: any) {
   failed = true;
   console.error(`FAIL ${err?.message ?? err}`);

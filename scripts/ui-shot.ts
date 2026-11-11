@@ -99,7 +99,60 @@ try {
   await page.waitForTimeout(150);
   await page.screenshot({ path: join(artifactDir, "ui-420-dark.png"), fullPage: true });
   console.log("PASS ui-420-dark.png", JSON.stringify(dark420));
-  console.log(`artifacts: ${join(artifactDir, "ui-1100.png")}, ${join(artifactDir, "ui-420.png")}, ${join(artifactDir, "ui-1100-dark.png")}, ${join(artifactDir, "ui-420-dark.png")}`);
+
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await page.locator("#logic-panel").screenshot({ path: join(artifactDir, "logic-1100.png") });
+  console.log("PASS logic-1100.png");
+  await page.setViewportSize({ width: 420, height: 900 });
+  const logic420 = await noHorizontalScroll(page, 420);
+  await page.locator("#logic-panel").screenshot({ path: join(artifactDir, "logic-420.png") });
+  console.log("PASS logic-420.png", JSON.stringify(logic420));
+
+  await page.setViewportSize({ width: 1100, height: 900 });
+  let searched = false;
+  for (const term of ["git", "the"]) {
+    await page.fill('[data-testid="session-search"]', term);
+    for (const scope of ["user", "reply", "bash"]) await page.check(`input.scope[value="${scope}"]`);
+    await page.click('[data-testid="session-search-button"]');
+    try {
+      await page.waitForSelector(".session-card", { timeout: 60_000 });
+      searched = true;
+      break;
+    } catch { /* try the next common word */ }
+  }
+  if (!searched) throw new Error("ui-shot session search listed no sessions");
+  await page.locator("#session-panel").screenshot({ path: join(artifactDir, "sessions-1100.png") });
+  console.log("PASS sessions-1100.png");
+  await page.setViewportSize({ width: 420, height: 900 });
+  const sessions420 = await noHorizontalScroll(page, 420);
+  await page.locator("#session-panel").screenshot({ path: join(artifactDir, "sessions-420.png") });
+  console.log("PASS sessions-420.png", JSON.stringify(sessions420));
+
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await page.click('[data-testid="session-preview"]');
+  await page.waitForSelector("#session-modal:not([hidden])");
+  await page.locator("#session-modal .modal-dialog").screenshot({ path: join(artifactDir, "preview-1100.png") });
+  console.log("PASS preview-1100.png");
+  await page.setViewportSize({ width: 420, height: 900 });
+  const preview420 = await noHorizontalScroll(page, 420);
+  await page.locator("#session-modal .modal-dialog").screenshot({ path: join(artifactDir, "preview-420.png") });
+  console.log("PASS preview-420.png", JSON.stringify(preview420));
+  await page.keyboard.press("Escape");
+  await page.waitForSelector("#session-modal", { state: "hidden" });
+
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await page.click('[data-testid="result-table"] tbody tr.result-row');
+  await page.waitForSelector("tr.detail");
+  await page.locator("tr.detail").screenshot({ path: join(artifactDir, "trace-1100.png") });
+  console.log("PASS trace-1100.png");
+  await page.setViewportSize({ width: 420, height: 900 });
+  const trace420 = await noHorizontalScroll(page, 420);
+  await page.locator("tr.detail").screenshot({ path: join(artifactDir, "trace-420.png") });
+  console.log("PASS trace-420.png", JSON.stringify(trace420));
+
+  const shots = ["ui-1100.png", "ui-420.png", "ui-1100-dark.png", "ui-420-dark.png", "logic-1100.png", "logic-420.png", "sessions-1100.png", "sessions-420.png", "preview-1100.png", "preview-420.png", "trace-1100.png", "trace-420.png"];
+  console.log(`artifacts: ${shots.map(name => join(artifactDir, name)).join(", ")}`);
 } finally {
   if (browser) await browser.close();
   child.kill();

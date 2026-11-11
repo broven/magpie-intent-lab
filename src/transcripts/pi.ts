@@ -1,4 +1,4 @@
-import { emptyTranscript, finish, jsonLines, parts, timestamp } from "./common";
+import { emptyTranscript, finish, jsonLines, parts, textOf, timestamp } from "./common";
 
 export async function readPi(file: string) {
   const t = emptyTranscript("pi", file);
@@ -10,12 +10,20 @@ export async function readPi(file: string) {
       t.cwd = typeof row.cwd === "string" ? row.cwd : "";
       t.start = Date.parse(timestamp(row.timestamp)) || 0;
     }
-    if (row.type !== "message" || !row.message || !["user", "assistant"].includes(row.message.role)) continue;
+    if (row.type !== "message" || !row.message) continue;
     const time = timestamp(row.timestamp ?? row.message.timestamp);
     if (!time) continue;
     const id = String(row.id ?? `${time}:${t.messages.length}`);
     if (seen.has(id)) continue;
     seen.add(id);
+    if (row.message.role === "toolResult") {
+      t.messages.push({
+        id, time, cwd: t.cwd, Role: "tool",
+        Parts: [{ Kind: "tool_result", Call: { id: row.message.toolCallId, name: row.message.toolName, output: textOf(row.message.content) } }],
+      });
+      continue;
+    }
+    if (!["user", "assistant"].includes(row.message.role)) continue;
     t.messages.push({ id, time, cwd: t.cwd, Role: row.message.role, Parts: parts(row.message.content) });
   }
   return finish(t);

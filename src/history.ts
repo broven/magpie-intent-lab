@@ -5,7 +5,7 @@ import { createInterface } from "node:readline";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { createHash } from "node:crypto";
-import { cutMiddle, trimSpace, userSaid } from "./textprep";
+import { cutMiddle, prevCut, textCut, trimSpace, userSaidDetailed } from "./textprep";
 import { folderKey, type RuleRequest } from "./rules";
 import { readClaude } from "./transcripts/claude";
 import { readCodex } from "./transcripts/codex";
@@ -13,12 +13,20 @@ import { readPi } from "./transcripts/pi";
 import { filesUnder, mapLimit, type Agent, type Transcript } from "./transcripts/common";
 
 const agentNames: Agent[] = ["claude", "codex", "pi"];
+export interface SamplePrep {
+  originalChars: number; reminders: number; beforeRequestChars: number; wholeInjection: boolean;
+  cut: { head: number; tail: number; marker: string; beforeChars: number; afterChars: number; truncated: boolean };
+}
 export interface Sample {
   id: string; agent: Agent; session: string; folder: string; time: string;
   text: string; fullText: string; prev: { user: string; reply: string };
+  prep: SamplePrep;
   features: RuleRequest; transcript: string; message: number; routing?: { id: number; time: string; group?: string };
 }
-export interface Filters { agents?: string | string[]; from?: string; to?: string; limit?: number }
+export interface Filters {
+  agents?: string | string[]; from?: string; to?: string; limit?: number;
+  all?: boolean; sessions?: string[];
+}
 interface Route {
   id: number; agent: Agent; session?: string; folder?: string; time: string;
   sub?: string; subagentId?: string; kind?: string; group?: { id?: string };
@@ -33,6 +41,11 @@ export interface HistoryStats {
 }
 export interface HistoryResult { samples: Sample[]; stats: HistoryStats }
 const parsed = new Map<string, { stamp: string; value: Promise<Transcript> }>();
+export async function readTranscript(file: string, agent: Agent): Promise<Transcript> {
+  return transcript(file, agent);
+}
+export const sessionId = (path: string): string => Buffer.from(path, "utf8").toString("base64url");
+export const sessionPath = (id: string): string => Buffer.from(id, "base64url").toString("utf8");
 async function transcript(file: string, agent: Agent): Promise<Transcript> {
   const info = await stat(file), stamp = `${info.size}:${info.mtimeMs}`;
   const old = parsed.get(file);
@@ -97,14 +110,19 @@ function emptyStats(): HistoryStats {
 }
 export async function readHistory(filters: Filters = {}, home = homedir()): Promise<HistoryResult> {
   const selected = range(filters), stats = emptyStats();
+  const wantedPaths = filters.sessions?.length ? new Set(filters.sessions) : null;
   const routing = await readRouting(join(home, ".config/magpie/routing"));
   stats.malformedRouting = routing.malformed;
   const routes = routing.routes.filter(r => selected.agents.has(r.agent) && Date.parse(r.time) >= selected.from && Date.parse(r.time) <= selected.to);
+  const keep = (file: string) => !wantedPaths || wantedPaths.has(file);
   const files = await Promise.all([
     selected.agents.has("claude") ? filesUnder(join(home, ".claude/projects")) : [],
     selected.agents.has("codex") ? filesUnder(join(home, ".codex/sessions"), [".jsonl", ".jsonl.zst"]) : [],
     selected.agents.has("pi") ? filesUnder(join(home, ".pi/agent/sessions")) : [],
   ]);
+  files[0] = files[0].filter(keep);
+  files[1] = files[1].filter(keep);
+  files[2] = files[2].filter(keep);
   const claudeFiles = new Map<string, string[]>();
   for (const file of files[0]) {
     const key = basename(file, ".jsonl");
@@ -120,9 +138,9 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
     list.push(file);
     codexFiles.set(key, list);
   }
-  const pi = await mapLimit(files[2], 6, f => transcript(f, "pi"));
+  const pi = await mapLimit(files[2], 24, f => transcript(f, "pi"));
   const linked = new Map<string, { t: Transcript; routes: Route[] }>();
-  await mapLimit(routes, 6, async route => {
+  await mapLimit(routes, 24, async route => {
     const s = stats.agents[route.agent]; s.routingRecords++; stats.routingRecords++;
     let candidates: Transcript[];
     if (route.agent === "pi") {
@@ -143,7 +161,7 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
     const old = linked.get(t.path);
     if (old) old.routes.push(route); else linked.set(t.path, { t, routes: [route] });
   });
-  const all: Sample[] = [];
+  let all: Sample[] = [];
   for (const { t, routes: attached } of linked.values()) {
     const s = stats.agents[t.agent]; s.transcripts++; stats.transcripts++; stats.malformedTranscript += t.malformed;
     attached.sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
@@ -157,15 +175,29 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
         continue;
       }
       if (m.Role !== "user") continue;
-      const text = userSaid(m);
+      const said = userSaidDetailed(m);
+      const text = said.text;
       if (!text) continue;
       reply = lastAssistant;
       const runes = Array.from(reply);
+      const beforeChars = Array.from(text).length;
+      const cut = cutMiddle(text, textCut.head, textCut.tail);
       const sample: Sample = {
         id: createHash("sha256").update(t.agent + "\0" + t.path + "\0" + m.id).digest("hex").slice(0, 24),
         agent: t.agent, session: t.path, folder: m.cwd || t.cwd, time: m.time,
-        text: cutMiddle(text, 3000, 1000), fullText: text,
-        prev: { user: cutMiddle(previousUser, 750, 250), reply: runes.length > 1000 ? "…" + runes.slice(-1000).join("") : reply },
+        text: cut, fullText: text,
+        prep: {
+          originalChars: said.originalChars, reminders: said.reminders,
+          beforeRequestChars: said.beforeRequestChars, wholeInjection: said.wholeInjection,
+          cut: {
+            head: textCut.head, tail: textCut.tail, marker: textCut.marker,
+            beforeChars, afterChars: Array.from(cut).length, truncated: beforeChars > textCut.head + textCut.tail,
+          },
+        },
+        prev: {
+          user: cutMiddle(previousUser, prevCut.userHead, prevCut.userTail),
+          reply: runes.length > prevCut.replyTail ? prevCut.replyPrefix + runes.slice(-prevCut.replyTail).join("") : reply,
+        },
         features: { agent: t.agent, folder: m.cwd || t.cwd, time: m.time, message: text },
         transcript: t.path, message: i,
       };
@@ -201,7 +233,8 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
       all.push(sample);
     }
   }
+  if (wantedPaths) all = all.filter(sample => wantedPaths.has(sample.session));
   for (const s of Object.values(stats.agents)) s.hitRate = s.routingRecords ? s.linkedRecords / s.routingRecords : 0;
   all.sort((a, b) => a.time.localeCompare(b.time) || a.id.localeCompare(b.id));
-  return { samples: all.slice(-selected.limit), stats };
+  return { samples: filters.all || wantedPaths ? all : all.slice(-selected.limit), stats };
 }

@@ -1,6 +1,4 @@
-import { createReadStream } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
-import { createInterface } from "node:readline";
 import { join } from "node:path";
 import type { Message, Part } from "../textprep";
 
@@ -34,19 +32,36 @@ export async function* jsonLines(file: string): AsyncGenerator<{ row?: any; malf
     }
     return;
   }
-  const input = createReadStream(file, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
-  try {
-    for await (const line of lines) {
-      if (!line.trim()) continue;
-      try { yield { row: JSON.parse(line) }; } catch { yield { malformed: true }; }
-    }
-  } finally { lines.close(); input.destroy(); }
+  // Reading the whole file and splitting is much faster than a readline
+  // iterator for the hundreds of small transcripts a full search touches.
+  const text = await Bun.file(file).text();
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try { yield { row: JSON.parse(line) }; } catch { yield { malformed: true }; }
+  }
 }
 export function timestamp(value: unknown): string {
   if (typeof value !== "string" && typeof value !== "number") return "";
   const ms = new Date(value).getTime();
   return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
+}
+export function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.flatMap(b => {
+      if (typeof b === "string") return [b];
+      if (!b || typeof b !== "object") return [];
+      if (typeof b.text === "string") return [b.text];
+      if (typeof b.content === "string") return [b.content];
+      return [];
+    }).join("\n");
+  }
+  if (content && typeof content === "object") {
+    const value = content as any;
+    if (typeof value.text === "string") return value.text;
+    if (typeof value.output === "string") return value.output;
+  }
+  return "";
 }
 export function parts(content: unknown): Part[] {
   if (typeof content === "string") return [{ Kind: "text", Text: content }];
@@ -55,8 +70,12 @@ export function parts(content: unknown): Part[] {
     if (!b || typeof b !== "object") return [];
     if (["text", "input_text", "output_text"].includes(b.type) && typeof b.text === "string") return [{ Kind: "text", Text: b.text }];
     if (["image", "input_image", "image_url"].includes(b.type)) return [{ Kind: "image" }];
-    if (["tool_use", "toolCall", "function_call"].includes(b.type)) return [{ Kind: "tool_call" }];
-    if (["tool_result", "toolResult", "function_call_output"].includes(b.type)) return [{ Kind: "tool_result" }];
+    if (["tool_use", "toolCall", "function_call"].includes(b.type)) {
+      return [{ Kind: "tool_call", Call: { id: b.id ?? b.call_id, name: b.name, input: b.input ?? b.arguments } }];
+    }
+    if (["tool_result", "toolResult", "function_call_output"].includes(b.type)) {
+      return [{ Kind: "tool_result", Call: { id: b.tool_use_id ?? b.toolCallId ?? b.call_id, name: b.name ?? b.toolName, output: textOf(b.content ?? b.output) } }];
+    }
     return [{ Kind: "thinking" }];
   });
 }
