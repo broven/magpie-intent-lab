@@ -17,6 +17,7 @@ export interface ServiceOptions {
   addr?: string;
   dir?: string;
   jev?: JevClient;
+  warm?: boolean;
 }
 export interface RunningService {
   server: ReturnType<typeof Bun.serve>;
@@ -347,6 +348,12 @@ export async function startService(options: ServiceOptions = {}): Promise<Runnin
       const server = Bun.serve({ hostname: "127.0.0.1", port: requested, idleTimeout: 255, fetch: guarded(makeFetch(jev, bin)) });
       const port = server.port ?? requested;
       if (options.log !== false) console.log(`intent-lab listening http://127.0.0.1:${port}`);
+      // Warm the transcript parse cache in the background, so the first
+      // search the user makes isn't the cold one (~8s over ~500 sessions).
+      if (options.warm !== false) {
+        searchSessions({ q: "\u0000warm", scopes: ["first", "user", "reply", "bash"], limit: 1 })
+          .catch(err => console.error(`[intent-lab] warm-up failed: ${err?.message ?? err}`));
+      }
       return { server, port, jev };
     } catch (err) {
       if (!options.retry) throw err;

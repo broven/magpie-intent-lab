@@ -68,15 +68,17 @@ const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // A search and its follow-up scopes usually arrive together. Keep the
 // linked-session result briefly so the second query does not reread routing
 // and every transcript; transcript parsing itself stays mtime-cached.
-const historyCache = new Map<string, { at: number; value: Awaited<ReturnType<typeof readHistory>> }>();
+const historyCache = new Map<string, { at: number; value: ReturnType<typeof readHistory> }>();
 const HISTORY_TTL = 30_000;
 async function historyFor(filters: Filters, home: string) {
   const key = JSON.stringify([filters.agents ?? "", filters.from ?? "", filters.to ?? "", home]);
   const old = historyCache.get(key);
   if (old && Date.now() - old.at < HISTORY_TTL) return old.value;
-  const value = await readHistory(filters, home);
+  // The promise is kept, not its value: a search made while the start-up
+  // warm-up is still reading shares that read instead of doing it again.
+  const value = readHistory(filters, home);
   historyCache.set(key, { at: Date.now(), value });
-  return value;
+  try { return await value; } catch (err) { historyCache.delete(key); throw err; }
 }
 function matcher(q: string, regex: boolean): RegExp {
   if (regex) return new RegExp(q, "gi");
