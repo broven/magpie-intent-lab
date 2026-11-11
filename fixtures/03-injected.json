@@ -1,0 +1,121 @@
+{
+  "messages": [
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": "<environment_context>cwd</environment_context>"
+        },
+        {
+          "Kind": "text",
+          "Text": "<user_instructions>hidden"
+        },
+        {
+          "Kind": "text",
+          "Text": "<turn_aborted>"
+        },
+        {
+          "Kind": "text",
+          "Text": "<user_shell_command>ls"
+        },
+        {
+          "Kind": "text",
+          "Text": "<subagent_notification>"
+        },
+        {
+          "Kind": "text",
+          "Text": "<in-app-browser-context url=\"x\">"
+        },
+        {
+          "Kind": "text",
+          "Text": "<external_codex_apps_open_page>"
+        },
+        {
+          "Kind": "text",
+          "Text": "<session-context id=\"x\">"
+        },
+        {
+          "Kind": "text",
+          "Text": "<task-notification>"
+        },
+        {
+          "Kind": "text",
+          "Text": "<subagent-notification>"
+        },
+        {
+          "Kind": "text",
+          "Text": "<plugin_reference>"
+        },
+        {
+          "Kind": "text",
+          "Text": "Available agent types for the Agent tool:"
+        },
+        {
+          "Kind": "text",
+          "Text": "Available agent types and the tools they have access to:"
+        },
+        {
+          "Kind": "text",
+          "Text": "New agent types are now available for the Agent tool:"
+        },
+        {
+          "Kind": "text",
+          "Text": "The TodoWrite tool hasn't been used recently."
+        },
+        {
+          "Kind": "text",
+          "Text": "The task tools haven't been used recently."
+        },
+        {
+          "Kind": "text",
+          "Text": "Conversation rewind applied."
+        },
+        {
+          "Kind": "text",
+          "Text": "Workspace rewind applied."
+        },
+        {
+          "Kind": "text",
+          "Text": "The following deferred tools are available"
+        },
+        {
+          "Kind": "text",
+          "Text": "# MCP Server Instructions"
+        },
+        {
+          "Kind": "text",
+          "Text": "The following MCP servers"
+        },
+        {
+          "Kind": "text",
+          "Text": "<system-reminder>unclosed"
+        },
+        {
+          "Kind": "text",
+          "Text": "# AGENTS.md instructions for /tmp/project\nbody"
+        },
+        {
+          "Kind": "tool_result",
+          "Text": "tool output"
+        },
+        {
+          "Kind": "text",
+          "Text": " implement it "
+        }
+      ]
+    }
+  ],
+  "model": "typesafe/jev-latest",
+  "intents": [
+    "写代码",
+    "问问题"
+  ],
+  "prev": {},
+  "scores": [
+    0,
+    3
+  ],
+  "rules": [],
+  "query": {}
+}

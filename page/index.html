@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Intent Lab</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f7f7f5; --fg: #1d1d1b; --muted: #666; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #191918; --fg: #ececea; --muted: #a3a39d; } }
+  body { margin: 0; padding: 2rem; background: var(--bg); color: var(--fg); font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.35rem; margin: 0 0 .4rem; }
+  p { color: var(--muted); margin: 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Intent Lab</h1>
+  <p id="status">正在连接 magpie…</p>
+</main>
+<script src="_magpie/bridge.js"></script>
+<script>
+(async () => {
+  const status = document.getElementById("status");
+  let target = "";
+  try {
+    await magpie.ready;
+    const options = await magpie.options.get();
+    const port = Number(options && options.port) > 0 ? Number(options.port) : 3488;
+    // The iframe's initial policy has connect-src 'none', so the whole
+    // interface comes from the service: navigate this frame to it.
+    target = magpie.service || `http://127.0.0.1:${port}/`;
+  } catch (err) {
+    status.textContent = "无法连接 magpie：" + (err && err.message ? err.message : err);
+    return;
+  }
+  if (target) location.replace(target);
+})();
+</script>
+</body>
+</html>

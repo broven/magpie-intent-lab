@@ -1,0 +1,69 @@
+{
+  "messages": [
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": "修复上个错误"
+        }
+      ]
+    },
+    {
+      "Role": "assistant",
+      "Parts": [
+        {
+          "Kind": "thinking",
+          "Text": "secret"
+        },
+        {
+          "Kind": "text",
+          "Text": " 我会先查日志 "
+        },
+        {
+          "Kind": "tool_call",
+          "Text": "not prose"
+        }
+      ]
+    },
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "tool_result",
+          "Text": "error"
+        }
+      ]
+    },
+    {
+      "Role": "assistant",
+      "Parts": [
+        {
+          "Kind": "tool_call",
+          "Text": "ignore"
+        }
+      ]
+    },
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": "继续"
+        }
+      ]
+    }
+  ],
+  "model": "typesafe/jev-latest",
+  "intents": [
+    "写代码",
+    "问问题"
+  ],
+  "prev": {},
+  "scores": [
+    0,
+    3
+  ],
+  "rules": [],
+  "query": {}
+}

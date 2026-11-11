@@ -1,0 +1,67 @@
+{
+  "messages": [
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": " run the TESTS "
+        }
+      ]
+    }
+  ],
+  "model": "typesafe/jev-latest",
+  "intents": [
+    "写代码",
+    "问问题"
+  ],
+  "prev": {},
+  "scores": [
+    0,
+    3
+  ],
+  "rules": [
+    {
+      "use": "p/a",
+      "intent": "CODING",
+      "tokens": 50,
+      "images": true,
+      "effort": "medium",
+      "agents": [
+        "claude"
+      ],
+      "folders": [
+        "/mnt/c/Work"
+      ],
+      "exceptFolders": [
+        "/mnt/c/Work/old"
+      ],
+      "where": [
+        {
+          "field": "message",
+          "op": "matches",
+          "value": "(?P<word>TESTS)$"
+        }
+      ]
+    },
+    {
+      "use": "p/b",
+      "intent": "coding"
+    },
+    {
+      "use": "p/c",
+      "intent": "design",
+      "pause": true
+    }
+  ],
+  "query": {
+    "Agent": "claude",
+    "Intent": "coding",
+    "Tokens": 80,
+    "Images": true,
+    "Effort": "high",
+    "Thinking": true,
+    "Folder": "C:\\work\\app",
+    "Message": "run the tests"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "messages": [
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": "# Context from my IDE setup:\n## My request:\nold\n## My request for Codex: \t\n fix the parser "
+        }
+      ]
+    }
+  ],
+  "model": "typesafe/jev-latest",
+  "intents": [
+    "写代码",
+    "问问题"
+  ],
+  "prev": {},
+  "scores": [
+    0,
+    3
+  ],
+  "rules": [],
+  "query": {}
+}

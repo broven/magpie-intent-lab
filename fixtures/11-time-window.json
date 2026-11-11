@@ -1,0 +1,64 @@
+{
+  "messages": [
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": "test hours"
+        }
+      ]
+    }
+  ],
+  "model": "typesafe/jev-latest",
+  "intents": [
+    "写代码",
+    "问问题"
+  ],
+  "prev": {},
+  "scores": [
+    0,
+    3
+  ],
+  "rules": [
+    {
+      "use": "p/a",
+      "intent": "late",
+      "time": {
+        "from": "22:00",
+        "to": "08:00",
+        "days": [
+          "mon"
+        ],
+        "zone": "Asia/Shanghai"
+      }
+    },
+    {
+      "use": "p/b",
+      "where": [
+        {
+          "field": "effort",
+          "op": "lte",
+          "value": "medium"
+        },
+        {
+          "field": "subagent",
+          "op": "not"
+        }
+      ]
+    },
+    {
+      "use": "p/c",
+      "intent": "after"
+    }
+  ],
+  "query": {
+    "At": "2026-11-10T01:30:00+08:00",
+    "Agent": "codex",
+    "Intent": "late",
+    "Off": true,
+    "Subagent": false,
+    "Thinking": false,
+    "Effort": ""
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "messages": [
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": "hello"
+        }
+      ]
+    }
+  ],
+  "model": "typesafe/jev-latest",
+  "intents": [
+    "coding"
+  ],
+  "prev": {},
+  "scores": [],
+  "rules": [
+    {
+      "use": "p/a",
+      "intent": "coding"
+    },
+    {
+      "use": "p/b",
+      "agents": [
+        "codex"
+      ]
+    },
+    {
+      "use": "p/c",
+      "intent": "hidden"
+    }
+  ],
+  "query": {
+    "Agent": "codex",
+    "Intent": "coding"
+  },
+  "answer": {
+    "answers": {
+      "intent": {
+        "choice": "none of these",
+        "confidence": 1,
+        "probabilities": {
+          "coding": 0.01,
+          "none of these": 0.99
+        }
+      }
+    }
+  }
+}

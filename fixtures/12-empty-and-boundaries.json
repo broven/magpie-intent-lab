@@ -1,0 +1,42 @@
+{
+  "messages": [
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": "<environment_context>hidden"
+        }
+      ]
+    },
+    {
+      "Role": "assistant",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": " visible without previous user "
+        }
+      ]
+    }
+  ],
+  "model": "typesafe/jev-latest",
+  "intents": [],
+  "prev": {},
+  "scores": [],
+  "rules": [
+    {
+      "use": "p/a"
+    },
+    {
+      "use": "p/b",
+      "intent": "Σ"
+    },
+    {
+      "use": "p/c",
+      "intent": "ς"
+    }
+  ],
+  "query": {
+    "Intent": "σ"
+  }
+}

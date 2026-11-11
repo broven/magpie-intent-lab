@@ -1,0 +1,46 @@
+{
+  "messages": [
+    {
+      "Role": "user",
+      "Parts": [
+        {
+          "Kind": "text",
+          "Text": "fix that"
+        }
+      ]
+    }
+  ],
+  "model": "typesafe/jev-latest",
+  "intents": [
+    "写代码",
+    "问问题"
+  ],
+  "prev": {
+    "Intent": "写代码",
+    "Effort": "high",
+    "User": "make a CLI",
+    "Reply": "which command?"
+  },
+  "scores": [
+    0,
+    3
+  ],
+  "rules": [],
+  "query": {},
+  "effort": true,
+  "answer": {
+    "answers": {
+      "intent": {
+        "choice": "写代码",
+        "confidence": 0.2,
+        "probabilities": {
+          "写代码": 0.9,
+          "问问题": 0.1
+        }
+      },
+      "effort": {
+        "score": 2.6
+      }
+    }
+  }
+}

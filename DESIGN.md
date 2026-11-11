@@ -1,0 +1,91 @@
+# magpie-intent-lab 设计
+
+magpie（yetone/magpie）社区插件。用**历史会话**回测路由组的 `intent` 规则，对比「当前配置」和「草稿」的分类结果和选中的模型，调好后一键写回 magpie。
+
+上游源码参考：`/tmp/magpie-latest`（`git clone --depth 1 https://github.com/yetone/magpie`）。下文的 `file:line` 都指这份源码，上游有改动时以源码为准。
+
+## 范围
+
+- v1 只做 **intent 规则**，不做 `effort=auto`。
+- 分类器只支持 **System One 决策模型**（Jev，例如 `typesafe/jev-latest`）。组的 classifier 如果是普通 chat 模型或 `group/<id>`，页面直接说明不支持。
+- 基线是「当前配置 vs 草稿」，两边都现场调 Jev，结果带缓存。
+
+## 形态（magpie 插件机制，见 docs/subsystems/plugin-runtime.md P4）
+
+- `package.json`
+  - `main: index.js`
+  - `magpie.page {title:"Intent Lab", titles:{zh:"意图回测"}, file:"page/index.html", icon:"page/icon.svg", service:{port:3488, option:"port"}}`
+  - `magpie.options {port:3488}`
+  - keywords 含 `magpie-plugin`
+  - 参考模板：`internal/plugin/testdata/pageservice/`
+- `index.js` 导出 `IntentLab = async (input, options) => {}`，在 `127.0.0.1:options.port` 起 `Bun.serve`。用全局变量防止重复启动；端口被占就每 200ms 重试一次，做法同模板。
+- `page/index.html` 引 `_magpie/bridge.js`，ready 后把**自己的 frame 导航**到 `magpie.service || http://127.0.0.1:<port>/`。原因是 iframe 的 CSP 为 `connect-src 'none'`，不能 fetch，所以整个界面由 service 直接提供。
+- service 跑在 magpie 的 Bun 宿主里，没有沙箱，能读文件、能执行命令。
+  - gateway 地址取 `process.env.MAGPIE_ADDR`，默认 `127.0.0.1:3425`。走 loopback 不需要 key。
+- 本地开发用 `magpie plugin add <本仓库绝对路径>`。改完代码再 add 一次，host 会重启并加载新代码。
+
+## 数据源
+
+1. **组和规则**：`~/.config/magpie/providers.json` 的 `groups[]`，只读。
+   - 字段：`rules[]`（`use`、`intent`、`agents`、`tokens`、`images`、`effort`、`compact`、`time/days/tz`、`folders`、`exceptFolders`、`when`……）、`classifier`、`intentSure`（为空时取 0.4）。
+   - 见 `internal/provider/grouprule.go`、`group.go:270`。
+2. **样本：magpie 路由过的会话里的用户 turn**。
+   - 从 `~/.config/magpie/routing/*.jsonl(.gz)` 拿到 `(agent, session, folder, time)`，再去 agent 自己的 transcript 取正文：
+     - claude：`~/.claude/projects/*/<session>.jsonl`
+     - codex：`~/.codex/sessions/**/rollout-*<session>.jsonl`
+     - pi：routing 记录的 `session` 为空。按 `folder` 加时间窗去 `~/.pi/agent/sessions/**` 里匹配 cwd 和时间相符的 session 文件。
+   - `conv` 是请求原始 JSON 字节的哈希，用 transcript 复算不出来，不要用它关联。
+   - 每个 session 的用户 turn 按时间排列，一个 turn 对应一条 `userSaid` 非空的 user 消息。
+   - 样本附带的特征：agent、folder（transcript 的 cwd）、time。关联到 routing 记录时，再附上 tokens、images、effort。
+3. **Jev**：`POST http://$MAGPIE_ADDR/v1/systemone`，body 由下文的 jevBody 生成，已实测可用。gateway 会自己做脱敏。
+
+## 逐位移植（必须和 Go 源码一致）
+
+把下面这些函数原样移植成 TS，字符串常量逐字复制：
+
+| Go | 位置 | 作用 |
+| --- | --- | --- |
+| `userWords` / `userSaid` / 注入前缀表 / `agentsFor` 正则 / `## My request:` | `internal/gateway/prompt.go:712-786` | 判断哪些文本是用户说的 |
+| `lastSaid`、`cutMiddle(3000,1000)` | `classify.go:264-290` | 取最后一条用户话并截断 |
+| `turnBefore`（prev user 750/250，prev reply 取末尾 1000 并加前缀 `…`） | `classify.go:296-335` | 上一轮上下文 |
+| `jevBody` / `jevState` / `intentAsk` / `levelAsk` / `priorAsk` / `noIntent` | `decide.go:120-240` | 请求体 |
+| `jevLevelled`（intents>1 时先探测是不是 levels，`noul>=0.5`） | `decide.go:342-385` | levels 判定 |
+| `readJev` / `sureOf` / `Confidence` / `intentOf`（阈值 `IntentSure`，levels 不受阈值约束，`Sure<0.4` 时回退到上一轮 intent） | `decide.go:47-71,245-313`，`provider/decide_wire.go:89-100` | 读答案 |
+| `Intents()`（大小写不敏感去重；遇到第一条无 intent 且其余条件匹配的规则就停）、`MatchRule`（第一条匹配者胜）、`Rule.Matches` | `provider/grouprule.go` | 规则求值 |
+
+- **上一轮 intent（`prev.Intent`）**：同一 session 内按顺序回放，把上一 turn 的结果带到下一 turn。规则见 `rules.go:331-340`：只有上一轮 intent 也在本组 intents 里才带。
+- **规则的非 intent 条件**：样本有对应特征就求值。拿不到特征的条件（例如 `when`，或没关联上 routing 记录时的 tokens），记为 `unknown`，在结果里标出来，并按「不匹配」处理。
+
+## service API（JSON）
+
+- `GET /api/groups`：返回带 intent 规则的组，以及 classifier、intentSure、规则列表、是否支持。
+- `GET /api/samples?agents=&from=&to=&limit=200`：返回样本列表（不调 Jev），附带关联统计：routing 记录数、找到 transcript 的数量、各 agent 的命中率。
+- `POST /api/run {group, draft:{rules, intentSure}, agents, from, to, limit}`：用 SSE 推进度，最终结果是每个样本一行：
+  - `{id, agent, folder, time, text(截断后), prev, current:{intent, said, sure, rule, use}, draft:{…}, changed, unknownConds}`
+  - 外加一个汇总：两边各 intent 的计数，以及 current→draft 的转移矩阵。
+- `POST /api/apply {group, draft, dryRun}`：生成 `magpie group rule rm/add … at=<n>` 命令序列。`dryRun` 时只返回命令；否则逐条执行，再用 `magpie group rule <group>` 读回结果。
+  - 只改 intent、use、增删规则。某条规则带有无法原样还原成 CLI 参数的字段时，拒绝写回这一条，并说明原因。
+  - magpie 可执行文件：先看 `options.magpieBin`，再看 `PATH` 里的 `magpie`，最后用 `/Applications/magpie.app/Contents/MacOS/magpie`。
+- **缓存**：`~/.config/magpie/intent-lab/cache.jsonl`，键为 `sha256(请求体)`，值为 Jev 答案。Jev 并发上限 4。
+
+## 界面（service 在 `/` 提供，原生 HTML+JS，不需要构建）
+
+- 选组：显示当前规则（只读）和草稿编辑器（intent 文本、use 下拉框只列组成员、增删、intentSure）。
+- 样本条件：日期范围、agent 多选、最近 N 个 turn（默认 200）。点「回测」后显示进度条。
+- 汇总：current→draft 转移矩阵、变化数。
+- 结果表：时间 / agent / folder / 消息摘要 / 当前 intent·sure·模型 / 草稿 intent·sure·模型 / 变化标记 / unknown 标记。
+  - 可以只看有变化的行，也可以按 intent 过滤。
+  - 点一行展开：全文、上一轮上下文、两边 Jev 的原始答案。
+- 写回：先预览命令，确认后执行，执行完显示读回的规则。
+
+## 验收
+
+- **对拍（parity）**：`scripts/parity.sh` 在 `/tmp/magpie-latest` 的临时副本里加一个 Go 测试，对 `fixtures/*.json`（原始 messages）输出 `userSaid`、`lastSaid`、`cutMiddle`、`turnBefore`、`jevBody`。TS 对同一批输入输出同样的内容，逐字节比较，打印 `parity: N/N identical`。
+- **E2E**：`bun scripts/e2e.ts` 起 service（随机端口），按下面的顺序跑，产物写到 `artifacts/e2e-<时间>.json`：
+  1. `GET /api/groups` 里有 `claude-opus`。
+  2. `GET /api/samples?limit=30` 至少有 1 条，并打印关联统计。
+  3. `POST /api/run` 用草稿等于当前配置的方式跑 30 条：每一行的 `changed` 都应为 false。
+  4. 草稿把 intent 改成 `"写代码或改代码"`，再跑：有 `changed` 行。
+  5. `POST /api/apply dryRun` 返回命令序列。
+  - E2E 不对真实配置执行 apply。
+- **装进 magpie**：`magpie plugin add <path>` 之后 `magpie plugin list` 里有它，`curl 127.0.0.1:3488/` 返回界面。

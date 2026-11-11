@@ -1,0 +1,67 @@
+package gateway
+
+import (
+ "encoding/json"
+ "fmt"
+ "os"
+ "path/filepath"
+ "testing"
+
+ "github.com/yetone/magpie/internal/provider"
+)
+
+func TestIntentLabParity(t *testing.T) {
+ files, err := filepath.Glob(filepath.Join(os.Getenv("INTENT_LAB_FIXTURES"), "*.json"))
+ if err != nil || len(files) < 8 { t.Fatalf("fixtures: %d, %v", len(files), err) }
+ results := map[string]any{}
+ for _, file := range files {
+  var f struct {
+   Messages []Message
+   Model string
+   Intents []string
+   Work map[string]string
+   Prev before
+   Effort bool
+   Scores []float64
+   Answer json.RawMessage
+   Levels bool
+   IntentSure *float64
+   Rules []provider.Rule
+   Query provider.RuleRequest
+  }
+  b, err := os.ReadFile(file)
+  if err != nil { t.Fatal(err) }
+  if err = json.Unmarshal(b, &f); err != nil { t.Fatal(err) }
+  req := &Request{Messages: f.Messages}
+  said := []string{}
+  for _, m := range f.Messages { said = append(said, userSaid(m)) }
+  index, text := lastSaid(req, len(req.Messages))
+  user, reply := turnBefore(req)
+  var body any
+  if err := json.Unmarshal(jevBody(f.Model, f.Intents, f.Work, f.Prev, f.Effort, userText(req)), &body); err != nil { t.Fatal(err) }
+  matched := []bool{}
+  for _, r := range f.Rules { matched = append(matched, r.Matches(f.Query)) }
+  intents := provider.Intents(f.Rules, f.Query)
+  if intents == nil { intents = []string{} }
+  result := map[string]any{
+   "userSaid": said,
+   "lastSaid": map[string]any{"index": index, "text": text},
+   "cutMiddle": cutMiddle(text, 3000, 1000),
+   "turnBefore": map[string]string{"user": user, "reply": reply},
+   "jevBody": body,
+   "levelsOf": levelsOf(f.Intents, f.Scores),
+   "matches": matched, "intents": intents, "matchRule": provider.MatchRule(f.Rules, f.Query),
+  }
+  if len(f.Answer) > 0 {
+   v, err := readJev(f.Answer, f.Intents, f.Levels, f.Prev)
+   if err != nil { t.Fatal(err) }
+   result["verdict"] = map[string]any{"intent":v.Intent,"said":v.Said,"topic":v.Topic,"sure":v.Sure,"effort":v.Effort,"score":v.Score}
+   result["intentOf"] = intentOf(v, provider.Group{IntentSure:f.IntentSure})
+  }
+  results[filepath.Base(file)] = result
+ }
+ b, err := json.Marshal(results)
+ if err != nil { t.Fatal(err) }
+ if err = os.WriteFile(os.Getenv("INTENT_LAB_GO_OUTPUT"), b, 0600); err != nil { t.Fatal(err) }
+ fmt.Printf("Go parity fixtures: %d\n", len(files))
+}
