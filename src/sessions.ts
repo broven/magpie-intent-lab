@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { assistantSaid, cutMiddle, trimSpace, turnStates, userSaidDetailed } from "./textprep";
-import { isHelperCall, readHistory, readTranscript, sessionId, sessionPath, type Filters, type Sample } from "./history";
+import { cachedTranscript, isHelperCall, readCatalog, readHistory, readTranscript, sessionId, sessionPath, warmRouting, type Filters, type Sample } from "./history";
 import { sessionFiles, subagentsOf, type SessionFile } from "./sessiontree";
 import { bashEvents, type BashEvent } from "./transcripts/bash";
 import { mapLimit, type Agent, type Transcript } from "./transcripts/common";
@@ -86,26 +86,26 @@ const historyCache = new Map<string, { at: number; value: ReturnType<typeof read
 // A catalog read parses every transcript; keep it warm across a search and
 // its follow-up scopes. Transcript parsing itself stays mtime-cached.
 const HISTORY_TTL = 5 * 60_000;
-// Build every scope's searchable text for every transcript. The start-up
-// warm-up does this in the background so the first full-scope search is not
-// the one paying for user/reply/bash extraction.
-export async function warmSearchTexts(home = homedir()): Promise<void> {
-  const history = await historyFor({ limit: 10_000, all: true }, home);
+// Warm the catalog's cheap index: routing rows and the transcript tree. The
+// first catalog request then only parses the few recent sessions it shows.
+export async function warmCatalog(home = homedir()): Promise<void> {
+  await Promise.all([warmRouting(home), sessionFiles(home)]);
+}
+// Subagent transcripts are large and no catalog row needs them. Parse them
+// in small, spaced batches after the catalog is warm, so a background warm
+// never makes the first request slow.
+export async function warmSubagents(home = homedir()): Promise<void> {
   const index = await sessionFiles(home);
-  const seen = new Set<string>();
-  const warm = async (path: string, agent: Agent) => {
-    if (seen.has(path)) return;
-    seen.add(path);
-    try {
-      const t = await readTranscript(path, agent);
-      for (const scope of searchScopes) textsFor(t, scope);
-    } catch { /* one unreadable file must not stop the rest */ }
-  };
-  for (const sample of history.samples) await warm(sample.session, sample.agent);
-  for (const file of index) await warm(file.path, file.agent);
+  const subs = index.filter(file => file.parentPath);
+  const batch = 1;
+  for (let i = 0; i < subs.length; i += batch) {
+    await Promise.all(subs.slice(i, i + batch).map(file =>
+      readTranscript(file.path, file.agent).catch(() => { /* one unreadable file */ })));
+    await Bun.sleep(250);
+  }
 }
 export async function historyFor(filters: Filters, home = homedir()) {
-  const key = JSON.stringify([filters.agents ?? "", filters.from ?? "", filters.to ?? "", home]);
+  const key = JSON.stringify([filters.agents ?? "", filters.from ?? "", filters.to ?? "", filters.mainOnly ?? false, home]);
   const old = historyCache.get(key);
   if (old && Date.now() - old.at < HISTORY_TTL) {
     old.at = Date.now();
@@ -120,6 +120,18 @@ export async function historyFor(filters: Filters, home = homedir()) {
 function matcher(q: string, regex: boolean): RegExp {
   if (regex) return new RegExp(q, "gi");
   return new RegExp(escapeRegExp(q), "gi");
+}
+// A necessary condition before parsing a whole subagent transcript: the
+// query appears somewhere in its raw JSONL. A query with characters JSON
+// escapes (quotes, backslashes) skips the shortcut and parses every file.
+async function rawMatch(path: string, re: RegExp): Promise<boolean> {
+  try {
+    const text = await Bun.file(path).text();
+    re.lastIndex = 0;
+    return re.test(text);
+  } catch {
+    return true;
+  }
 }
 function matches(text: string, re: RegExp): { start: number; end: number }[] {
   const out: { start: number; end: number }[] = [];
@@ -224,9 +236,22 @@ export async function searchSessions(query: SessionSearch, home = homedir()): Pr
   }
   const limit = query.limit ?? 30;
   if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error("limit 必须是 1…1000 的整数");
+  if (!q) {
+    const entries = await readCatalog({ agents: query.agents, from: query.from, to: query.to }, home, limit);
+    return {
+      sessions: entries.map(entry => ({
+        id: entry.id, agent: entry.agent, folder: entry.folder,
+        start: entry.start, end: entry.end, lastTurn: entry.lastTurn,
+        first: entry.first, hits: 0, snippets: [], turns: entry.turns, subagents: entry.subagents,
+      })),
+      durationMs: Math.round(performance.now() - started),
+    };
+  }
   // The catalog always reads every turn of a session. A date range picks the
   // sessions by their last turn; it must not cut the replayed session short.
-  const history = await historyFor({ agents: query.agents, limit: 10_000, all: true }, home);
+  // Subagents are left out: a catalog row counts them from files, and their
+  // contents are read only by a query, a preview or a replay.
+  const history = await historyFor({ agents: query.agents, limit: 10_000, all: true, mainOnly: true }, home);
   const index = await sessionFiles(home);
   const byPath = new Map(index.map(file => [file.path, file]));
   const rootCache = new Map<string, string>();
@@ -282,12 +307,21 @@ export async function searchSessions(query: SessionSearch, home = homedir()): Pr
     const snippets: SearchSnippet[] = [];
     if (q && re) {
       const targets: { t: Transcript; subagent?: string }[] = [{ t }];
-      for (const sub of subs) {
+      // A subagent file is parsed only when the raw query occurs in it. The
+      // raw JSONL contains every message text, so a miss is a miss for every
+      // scope; a hit still goes through the scope extractor below. A file
+      // already parsed for an earlier search is reused as-is: it skipped
+      // parsing once, and reading its raw bytes again would only be slower.
+      const rawSafe = !/["\\]/.test(q);
+      const children = await mapLimit(subs, 8, async sub => {
         try {
-          const child = await readTranscript(sub.path, sub.agent);
-          if (!isHelperCall(child)) targets.push({ t: child, subagent: sub.subagentId ?? sub.key });
-        } catch { /* a broken subagent must not hide its parent */ }
-      }
+          const cached = await cachedTranscript(sub.path);
+          const child = cached ?? (rawSafe && !(await rawMatch(sub.path, re!)) ? null : await readTranscript(sub.path, sub.agent));
+          if (!child || isHelperCall(child)) return null;
+          return { t: child, subagent: sub.subagentId ?? sub.key };
+        } catch { return null; }
+      });
+      for (const child of children) if (child) targets.push(child);
       for (const target of targets) {
         for (const item of searchTexts(target.t, scopes)) {
           const found = matches(item.text, re);

@@ -722,7 +722,8 @@ try {
   });
 
   // F-4: what agent does magpie's routing log show for the plugin's own Jev
-  // calls? Printed, not asserted.
+  // calls? Printed, and checked to be neither of the two names it used to
+  // inherit: magpie (its own calls) and Bun (the bare runtime).
   const routingDir = join(homedir(), ".config/magpie/routing");
   const startedAt = Date.parse(artifact.started);
   const jevAgents: Record<string, number> = {};
@@ -745,7 +746,11 @@ try {
   } catch { /* the log is evidence, not a gate */ }
   artifact.jevAgent = { rows: jevRows, agents: jevAgents };
   console.log(`F-4 plugin Jev requests during e2e (${jevRows}): ${Object.keys(jevAgents).length ? Object.entries(jevAgents).map(([agent, count]) => `${agent}=${count}`).join(", ") : "(none found)"}`);
-  check("F-4 plugin Jev requests logged as agent", { rows: jevRows, agents: jevAgents });
+  assert.ok(jevRows > 0, "F-4 must see the plugin's Jev requests in the routing log");
+  for (const agent of Object.keys(jevAgents)) {
+    assert.ok(agent !== "magpie" && agent !== "Bun", `F-4 plugin Jev requests must not be logged as ${agent}`);
+  }
+  check("F-4 plugin Jev requests logged as their own agent", { rows: jevRows, agents: jevAgents });
   artifact.status = "PASS";
 } catch (error: any) {
   artifact.status = "FAIL";

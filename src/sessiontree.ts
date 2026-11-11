@@ -1,7 +1,6 @@
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { stat } from "node:fs/promises";
-import { readFile } from "node:fs/promises";
 import { filesUnder, type Agent } from "./transcripts/common";
 
 // One entry per transcript file, with its place in a session tree. A main
@@ -33,14 +32,19 @@ export function sessionFiles(home = homedir()): Promise<SessionFile[]> {
 
 const uuid = /[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}/i;
 
+const claudeSubagent = /[/\\]subagents[/\\](?:workflows[/\\][^/\\]+[/\\])?agent-([^/\\]+)\.jsonl$/;
+const piSubagent = /[/\\]([^/\\]+)[/\\]run-[^/\\]+[/\\]session\.jsonl$/;
+// A path decides claude and pi subagents. Codex names its parent only in the
+// rollout's first line, which is not available for a compressed rollout.
+export function isSubagentPath(file: string, agent: Agent): boolean {
+  return (agent === "claude" && claudeSubagent.test(file)) || (agent === "pi" && piSubagent.test(file));
+}
+
 async function firstLine(file: string): Promise<string> {
-  if (file.endsWith(".zst")) {
-    try {
-      const text = new TextDecoder().decode(Bun.zstdDecompressSync(await readFile(file)));
-      const end = text.indexOf("\n");
-      return end < 0 ? text : text.slice(0, end);
-    } catch { return ""; }
-  }
+  // Bun has no streaming zstd: decompressing a compressed rollout means
+  // inflating the whole file. Archived codex rollouts fall back to the
+  // thread id in their file name instead; they carry no subagent parents.
+  if (file.endsWith(".zst")) return "";
   try {
     const text = await Bun.file(file).slice(0, 512_000).text();
     const end = text.indexOf("\n");
@@ -76,7 +80,7 @@ async function build(home: string): Promise<SessionFile[]> {
   ]);
   const out: SessionFile[] = [];
   for (const file of claudeFiles) {
-    const sub = /[/\\]subagents[/\\](?:workflows[/\\][^/\\]+[/\\])?agent-([^/\\]+)\.jsonl$/.exec(file);
+    const sub = claudeSubagent.exec(file);
     if (sub) {
       out.push({
         path: file, agent: "claude", key: sub[1], subagentId: sub[1],
@@ -114,7 +118,7 @@ async function build(home: string): Promise<SessionFile[]> {
   }
   out.push(...codex);
   for (const file of piFiles) {
-    const sub = /[/\\]([^/\\]+)[/\\]run-[^/\\]+[/\\]session\.jsonl$/.exec(file);
+    const sub = piSubagent.exec(file);
     if (sub) {
       out.push({
         path: file, agent: "pi", key: sub[1], subagentId: sub[1],

@@ -200,7 +200,7 @@ export class JevClient {
       if (meter) meter.requests++;
       const res = await fetch(this.url, {
         method: "POST",
-        headers: { "content-type": "application/json", "user-agent": `magpie-intent-lab/${pkg.version}` },
+        headers: { "content-type": "application/json", "user-agent": `intent-lab/${pkg.version}` },
         body: bytes, signal: AbortSignal.timeout(120_000),
       });
       if (!res.ok) throw new Error(`Jev HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);

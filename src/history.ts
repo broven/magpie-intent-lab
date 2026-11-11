@@ -10,6 +10,7 @@ import { folderKey, type RuleRequest } from "./rules";
 import { readClaude } from "./transcripts/claude";
 import { readCodex } from "./transcripts/codex";
 import { readPi } from "./transcripts/pi";
+import { isSubagentPath, sessionFiles, type SessionFile } from "./sessiontree";
 import { filesUnder, mapLimit, type Agent, type Transcript } from "./transcripts/common";
 
 const agentNames: Agent[] = ["claude", "codex", "pi"];
@@ -29,6 +30,10 @@ export interface Sample {
 export interface Filters {
   agents?: string | string[]; from?: string; to?: string; limit?: number;
   all?: boolean; sessions?: string[];
+  // The catalog only lists main sessions. Their subagent transcripts are
+  // large, and nothing in a catalog row needs their contents: the count comes
+  // from files and the last-turn time from mtimes.
+  mainOnly?: boolean;
 }
 interface RouteTry {
   id?: string; model?: string; served?: string; status?: number; done?: boolean;
@@ -54,6 +59,22 @@ export interface HistoryResult { samples: Sample[]; stats: HistoryStats }
 const parsed = new Map<string, { stamp: string; value: Promise<Transcript>; checkedAt: number }>();
 export async function readTranscript(file: string, agent: Agent): Promise<Transcript> {
   return transcript(file, agent);
+}
+// A search checks each subagent for the query before parsing it. When the
+// transcript is already parsed (an earlier search, or the background warm),
+// reuse it instead of reading the whole raw file again; the stat keeps a
+// changed file from being searched in its old shape.
+export async function cachedTranscript(file: string): Promise<Transcript | undefined> {
+  const old = parsed.get(file);
+  if (!old) return undefined;
+  try {
+    const info = await stat(file), stamp = `${info.size}:${info.mtimeMs}`;
+    if (old.stamp !== stamp) return undefined;
+    old.checkedAt = Date.now();
+    return await old.value;
+  } catch {
+    return undefined;
+  }
 }
 export const sessionId = (path: string): string => Buffer.from(path, "utf8").toString("base64url");
 export const sessionPath = (id: string): string => Buffer.from(id, "base64url").toString("utf8");
@@ -163,6 +184,24 @@ async function readRouting(dir: string): Promise<{ routes: Route[]; malformed: n
   }
   return { routes: [...rows.values()].sort((a, b) => Date.parse(a.time) - Date.parse(b.time)), malformed };
 }
+// A catalog and the search that follows it read the same routing log. Keep
+// it briefly; the log is appended to, so the window stays short.
+const routingCache = new Map<string, { at: number; value: ReturnType<typeof readRouting> }>();
+const ROUTING_TTL = 10_000;
+function routingFor(dir: string): ReturnType<typeof readRouting> {
+  const old = routingCache.get(dir);
+  if (old && Date.now() - old.at < ROUTING_TTL) {
+    old.at = Date.now();
+    return old.value;
+  }
+  const value = readRouting(dir);
+  routingCache.set(dir, { at: Date.now(), value });
+  value.catch(() => routingCache.delete(dir));
+  return value;
+}
+export async function warmRouting(home = homedir()): Promise<void> {
+  await routingFor(join(home, ".config/magpie/routing"));
+}
 // The routing log's session key, as the transcript files use it: a Claude
 // subagent has its own file, and Codex names its rollout by thread id.
 function routeSessionKey(route: Route): string {
@@ -219,7 +258,7 @@ function emptyStats(): HistoryStats {
 export async function readHistory(filters: Filters = {}, home = homedir()): Promise<HistoryResult> {
   const selected = range(filters), stats = emptyStats();
   const wantedPaths = filters.sessions?.length ? new Set(filters.sessions) : null;
-  const routing = await readRouting(join(home, ".config/magpie/routing"));
+  const routing = await routingFor(join(home, ".config/magpie/routing"));
   stats.malformedRouting = routing.malformed;
   const routes = routing.routes.filter(r => selected.agents.has(r.agent) && Date.parse(r.time) >= selected.from && Date.parse(r.time) <= selected.to);
   // A session's first answer and a turn's prompt size can lie just outside
@@ -271,17 +310,20 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
     let candidates: Transcript[];
     if (route.agent === "pi") {
       const path = route.session ? piPaths.get(route.session) : undefined;
-      candidates = path ? [await transcript(path, "pi")] : [];
+      const sub = path ? isSubagentPath(path, "pi") : false;
+      candidates = path && !(filters.mainOnly && sub) ? [await transcript(path, "pi")] : [];
     } else {
-      const paths = route.agent === "claude"
+      let paths = route.agent === "claude"
         ? claudeFiles.get(route.subagentId || route.sub ? `agent-${route.subagentId || route.sub}` : route.session || "") ?? []
         : codexFiles.get(route.session || "") ?? [];
+      if (filters.mainOnly) paths = paths.filter(p => !isSubagentPath(p, route.agent));
       candidates = await Promise.all(paths.map(p => transcript(p, route.agent)));
       if (candidates.length > 1) candidates = candidates.filter(t => sameFolder(route, t));
     }
     if (candidates.length > 1) { s.ambiguous++; return; }
     if (candidates.length !== 1) return;
     const t = candidates[0];
+    if (filters.mainOnly && t.parentKey) return;
     if (isHelperCall(t)) return;
     if (t.agent === "codex" && t.parentKey && !t.parentPath) {
       t.parentPath = codexFiles.get(t.parentKey)?.[0];
@@ -292,7 +334,7 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
   });
   // A selected subagent may have no routing rows of its own; it still has
   // turns to replay, with an unknown initial member.
-  if (wantedPaths) {
+  if (wantedPaths && !filters.mainOnly) {
     const agentOfPath = new Map<string, Agent>();
     files[0].forEach(path => agentOfPath.set(path, "claude"));
     files[1].forEach(path => agentOfPath.set(path, "codex"));
@@ -420,4 +462,105 @@ export async function readHistory(filters: Filters = {}, home = homedir()): Prom
   for (const s of Object.values(stats.agents)) s.hitRate = s.routingRecords ? s.linkedRecords / s.routingRecords : 0;
   all.sort((a, b) => a.time.localeCompare(b.time) || a.id.localeCompare(b.id));
   return { samples: filters.all || wantedPaths ? all : all.slice(-selected.limit), stats };
+}
+
+export interface CatalogEntry {
+  id: string; path: string; agent: Agent; folder: string;
+  start: string; end: string; lastTurn: string; first: string;
+  turns: number; subagents: number;
+}
+
+const uuidRe = /[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}/i;
+
+// A catalog row needs a session's first message, turn count and times, not
+// its samples. Routing rows and file mtimes pick the recent roots cheaply;
+// only those transcripts are parsed.
+export async function readCatalog(filters: Filters, home = homedir(), limit = 30): Promise<CatalogEntry[]> {
+  const selected = range(filters);
+  const [routing, index] = await Promise.all([
+    routingFor(join(home, ".config/magpie/routing")),
+    sessionFiles(home),
+  ]);
+  const byPath = new Map(index.map(file => [file.path, file]));
+  const children = new Map<string, SessionFile[]>();
+  for (const file of index) {
+    if (!file.parentPath) continue;
+    const list = children.get(file.parentPath);
+    if (list) list.push(file); else children.set(file.parentPath, [file]);
+  }
+  const claudeMain = new Map<string, string>();
+  const claudeSub = new Map<string, string>();
+  const codexMain = new Map<string, string>();
+  const piMain = new Map<string, string>();
+  for (const file of index) {
+    if (file.agent === "claude") {
+      if (file.parentPath) claudeSub.set(file.subagentId ?? file.key, file.parentPath);
+      else claudeMain.set(file.key, file.path);
+    } else if (file.agent === "codex") {
+      const id = basename(file.path).match(uuidRe)?.[0];
+      if (id) codexMain.set(id, file.parentPath ?? file.path);
+    } else if (!file.parentPath) {
+      piMain.set(file.key, file.path);
+    }
+  }
+  const latest = new Map<string, number>();
+  const roots = new Set<string>();
+  const touch = (root: string, at: number) => {
+    if (!root || !Number.isFinite(at)) return;
+    roots.add(root);
+    if (at > (latest.get(root) ?? -Infinity)) latest.set(root, at);
+  };
+  for (const route of routing.routes) {
+    if (!selected.agents.has(route.agent)) continue;
+    const key = routeSessionKey(route);
+    const root = route.agent === "claude"
+      ? route.subagentId || route.sub ? claudeSub.get(key) ?? "" : claudeMain.get(key) ?? ""
+      : route.agent === "codex" ? codexMain.get(key) ?? "" : piMain.get(key) ?? "";
+    touch(root, Date.parse(route.time));
+  }
+  // A root is listed only when a routing row links it; its own and its
+  // subagents' file times only refine how recent it is.
+  for (const file of index) if (file.mtime) touch(file.parentPath ?? file.path, Date.parse(file.mtime));
+  const candidates = [...roots]
+    .map(root => byPath.get(root))
+    .filter((file): file is SessionFile => !!file && !file.parentPath && selected.agents.has(file.agent))
+    .map(file => ({ file, at: latest.get(file.path) ?? 0 }))
+    .filter(item => item.at >= selected.from && item.at <= selected.to)
+    .sort((a, b) => b.at - a.at || a.file.path.localeCompare(b.file.path))
+    .slice(0, limit + 10);
+  const entries: CatalogEntry[] = [];
+  for (const { file } of candidates) {
+    const t = await readTranscript(file.path, file.agent);
+    if (isHelperCall(t)) continue;
+    const summary = lightSummary(t);
+    if (!summary.turns) continue;
+    const at = Date.parse(summary.lastTurn);
+    if (!(at >= selected.from && at <= selected.to)) continue;
+    entries.push({
+      id: sessionId(file.path), path: file.path, agent: file.agent,
+      folder: t.cwd || summary.folder,
+      start: t.start ? new Date(t.start).toISOString() : summary.firstTime,
+      end: t.end ? new Date(t.end).toISOString() : summary.lastTurn,
+      lastTurn: summary.lastTurn, first: cutMiddle(summary.first, 240, 0),
+      turns: summary.turns, subagents: (children.get(file.path) ?? []).length,
+    });
+  }
+  entries.sort((a, b) => b.lastTurn.localeCompare(a.lastTurn) || a.id.localeCompare(b.id));
+  return entries.slice(0, limit);
+}
+
+function lightSummary(t: Transcript) {
+  const states = turnStates(t.messages);
+  let turns = 0, lastTurn = "", first = "", firstTime = "", folder = "";
+  for (let i = 0; i < t.messages.length; i++) {
+    const m = t.messages[i];
+    if (m.Role !== "user") continue;
+    const said = userSaidDetailed(m).text;
+    if (!said) continue;
+    if (!states[i].newTurn) continue;
+    turns++;
+    lastTurn = m.time;
+    if (!first) { first = said; firstTime = m.time; folder = m.cwd || t.cwd; }
+  }
+  return { turns, lastTurn, first, firstTime, folder };
 }

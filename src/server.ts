@@ -4,7 +4,7 @@ import { replay } from "./replay";
 import { JevClient } from "./jev";
 import { planApply, type ApplyPlan } from "./apply";
 import { logicFor } from "./logic";
-import { historyFor, searchSessions, sessionPreview, warmSearchTexts } from "./sessions";
+import { historyFor, searchSessions, sessionPreview, warmCatalog, warmSubagents } from "./sessions";
 import { subagentsOf } from "./sessiontree";
 import { dirname, extname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -365,13 +365,13 @@ export async function startService(options: ServiceOptions = {}): Promise<Runnin
       const server = Bun.serve({ hostname: "127.0.0.1", port: requested, idleTimeout: 255, fetch: guarded(makeFetch(jev, bin)) });
       const port = server.port ?? requested;
       if (options.log !== false) console.log(`intent-lab listening http://127.0.0.1:${port}`);
-      // Warm the transcript parse cache in the background. The first history
-      // read is the cold one; a catalog/search made after this shares it.
-      // Search text extraction runs after it, so /api/samples is not delayed.
+      // Warm the catalog first: that is the read the first panel request
+      // shares. Subagents are parsed later, one at a time with pauses, so a
+      // large corpus never competes with the first request.
       if (options.warm !== false) {
-        historyFor({ limit: 10_000, all: true })
-          .then(() => Bun.sleep(100))
-          .then(() => warmSearchTexts())
+        warmCatalog()
+          .then(() => Bun.sleep(1_000))
+          .then(() => warmSubagents())
           .catch(err => console.error(`[intent-lab] warm-up failed: ${err?.message ?? err}`));
       }
       return { server, port, jev };
@@ -385,5 +385,9 @@ export async function startService(options: ServiceOptions = {}): Promise<Runnin
 if (import.meta.main) {
   const raw = process.env.INTENT_LAB_PORT;
   const port = raw === undefined ? 3488 : Number(raw);
-  await startService({ port: Number.isInteger(port) && port >= 0 ? port : 3488, log: true });
+  await startService({
+    port: Number.isInteger(port) && port >= 0 ? port : 3488,
+    log: true,
+    warm: process.env.INTENT_LAB_WARM !== "0",
+  });
 }
