@@ -135,6 +135,41 @@ magpie（yetone/magpie）社区插件。用**历史会话**回测路由组的 `i
   - `POST /api/run` 增加 `sessions:[id]` 参数，传了就只回测这些会话。
 - **性能**：transcript 解析结果在内存里缓存，按文件 mtime 失效。全量搜索一次应在 5 秒内完成（claude 约 528 个会话）。
 
+## 阶段 D：分轮对齐 turnIn + 模拟会话粘性（2026-11-12 与用户确认）
+
+### D1 分轮按 magpie 的 `turnIn` 逐位移植
+
+- **问题**：现在把每条 `userSaid` 非空的 user 消息都算作新一轮。magpie 的 `turnIn`（`internal/gateway/affinity.go:408`）规定，下面两种情况都算本轮的继续，不调分类器：
+  - 消息里带 tool_result；
+  - 工具结果之后、带图片的那条文字（算图片说明）。
+- **实测**：3655 个样本里有 16 个不一致，主要是 `<fork-boilerplate>` 和工具结果之后贴图的消息。
+- **做法**：
+  - 逐位移植 `turnIn`，以及它用到的 `saysAnything`、`withImages`。
+  - 样本只取 `turnIn(messages[0..i]).within === false` 且这条消息开启了新一轮的位置。
+  - parity 对拍加入 turnIn：fixtures 至少覆盖 tool_result 与文字同一条、结果之后的图片说明、只有图片的消息、fork 开场。
+
+### D2 模拟会话粘性（每个会话按时间顺序，current 和 draft 各模拟一遍）
+
+依据：`gateway.go` 中 `ruleOver` 的调用处（约 3201 行），以及 `rules.go:749-809`。
+
+- **新一轮命中规则**（有 use）：规则成员排到最前，会盖过粘性。实际成员 = 规则的 use。如果和上一轮不同，这一轮记为**切换**。
+- **新一轮没命中规则**：不进入规则排序逻辑，只剩粘性起作用，实际成员 = 上一轮的实际成员，不切回去。
+  - 这条依赖组的 affinity 模式。先读 `affine()`（`gateway.go` / `affinity.go`），确认各模式（session / turn / none / strict 等）在这里的行为，再按模式模拟。
+  - 粘不住的模式，实际成员记为「组默认路由（成员未知）」。
+- **会话第一轮之前的初始成员**：取 routing 日志里该会话第一条关联记录实际服务的成员（provider/model，看 `served` 或 `tries`）；取不到时记为「未知」。
+- **不模拟**：失败转移、rest、账号限额、粘性超时。在判定逻辑面板第 7 节「与真实路由的差异」里写明。
+- **切换代价**：切换那一轮要在新供应商那边重新写入整段前缀。前缀 token 数优先取同会话、这一轮开始后第一条 routing 记录的 `prompt.tokens` 或 `tokens`；取不到时按 transcript 前缀字符数 / 4 估算，界面上标 `≈`。
+
+### 界面与 API
+
+- `/api/run` 每行的 current 和 draft 各增加 `{member, switched, from, prefixTokens, prefixEstimated, stickyWhy}`。`stickyWhy` 的取值：`rule` / `kept` / `initial` / `unknown`。
+- **结果表**：
+  - 新增「实际模型」列，两边各一列。切换的行加醒目标记，写成「jmds → wokey」，并附上前缀 token 数。
+  - 原来的「规则 use」列继续保留。
+- **单行判定过程（C2）末尾加一步「粘性」**：上一轮成员 → 本轮是否命中 → 实际成员 → 原因。
+- **汇总**：两边各给出切换总次数、发生切换的会话数、切换时重写的前缀 token 总数（标出其中估算的部分），并显示 current 与 draft 的差。
+- **判定逻辑面板**：在「选规则」之后插入「粘性」一步，标源码位置，写明本组的 affinity 模式和上面的规则。
+
 ## 验收
 
 - **对拍（parity）**：`scripts/parity.sh` 在 `/tmp/magpie-latest` 的临时副本里加一个 Go 测试，对 `fixtures/*.json`（原始 messages）输出 `userSaid`、`lastSaid`、`cutMiddle`、`turnBefore`、`jevBody`。TS 对同一批输入输出同样的内容，逐字节比较，打印 `parity: N/N identical`。
